@@ -1,0 +1,26 @@
+# ── Company data NEVER goes in the repo ──────────────────────────────────────
+data/
+*.db
+*.db-wal
+*.db-shm
+blobs/
+exports/
+backups/
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# build output
+dist/
+release/
+node_modules/
+*.tsbuildinfo
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

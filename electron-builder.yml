@@ -1,0 +1,44 @@
+appId: com.recruitai.app
+productName: recruitAI
+copyright: MIT
+asar: true
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**
+  - package.json
+  - "!**/*.map"
+
+mac:
+  category: public.app-category.productivity
+  darkModeSupport: true
+  # Unsigned. Gatekeeper will quarantine the download; the README documents the
+  # one-time `xattr -dr com.apple.quarantine` fix. Signing needs a $99/yr Apple
+  # Developer account, which this tool does not justify for a single operator.
+  identity: null
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+
+win:
+  target:
+    - target: nsis
+      arch: [x64, arm64]
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+
+linux:
+  category: Office
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64]

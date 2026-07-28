@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Strict CSP: this app has zero CDN or remote dependencies, so no remote
+      origin is ever allowed. 'unsafe-inline' is required in style-src because
+      Radix and cmdk position their layers by writing inline style attributes —
+      without it every popover, tooltip and dialog renders unpositioned.
+      script-src carries it only for the theme bootstrap below, which must run
+      before the bundle to avoid a light flash.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self' 'unsafe-inline' 'unsafe-eval';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob:;
+        font-src 'self' data:;
+        connect-src 'self' ws://localhost:5183 http://localhost:5183;
+        media-src 'self' data: blob:;
+        object-src 'none';
+        frame-src 'none';
+        base-uri 'none';
+        form-action 'none';
+      "
+    />
+    <title>recruitAI</title>
+    <script>
+      // Runs before the bundle so the first paint is already the right theme.
+      (function () {
+        try {
+          var pref = localStorage.getItem('recruitai.theme') || 'system';
+          var dark =
+            pref === 'dark' ||
+            (pref !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var root = document.documentElement;
+          root.classList.toggle('dark', dark);
+          root.style.colorScheme = dark ? 'dark' : 'light';
+          document.write(
+            '<style id="boot-bg">html,body{background:' +
+              (dark ? '#141619' : '#fbfbfc') +
+              '}</style>',
+          );
+        } catch (e) {
+          /* localStorage can be unavailable; the default dark class is fine */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>
