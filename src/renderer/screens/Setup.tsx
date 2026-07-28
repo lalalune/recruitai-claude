@@ -8,7 +8,6 @@ import { ProgressBar, ProgressPanel } from '../components/ProgressPanel.js';
 import { Button } from '../components/ui/button.js';
 import { GmailPanel, IcpFields, useSettings } from './Settings.js';
 
-const DONE_KEY = 'recruitai.setup.done';
 const STEP_KEY = 'recruitai.setup.step';
 
 const STEPS = ['Welcome', 'Gmail', 'Your ICP', 'First run'] as const;
@@ -31,7 +30,10 @@ function navigate(screen: string, onNavigate?: (screen: string) => void) {
 
 export function Setup({ open, onClose, onNavigate }: SetupProps = {}) {
   const qc = useQueryClient();
-  const [visible, setVisible] = useState(() => open ?? localStorage.getItem(DONE_KEY) !== '1');
+  // Controlled by default. An undefined `open` means "rendered as a screen", in
+  // which case it is visible — a screen that renders null leaves the operator
+  // staring at an empty window with no way to navigate out.
+  const [visible, setVisible] = useState(() => open ?? true);
   const [step, setStep] = useState(() => {
     const n = Number(localStorage.getItem(STEP_KEY));
     return Number.isFinite(n) && n >= 0 && n < STEPS.length ? n : 0;
@@ -48,7 +50,6 @@ export function Setup({ open, onClose, onNavigate }: SetupProps = {}) {
   const { data: settings } = useSettings();
 
   const finish = (goToReview: boolean) => {
-    localStorage.setItem(DONE_KEY, '1');
     localStorage.removeItem(STEP_KEY);
     setVisible(false);
     onClose?.();

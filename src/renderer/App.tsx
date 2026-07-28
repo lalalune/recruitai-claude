@@ -137,7 +137,9 @@ export default function App() {
         {screen === 'outreach' && <Outreach />}
         {screen === 'pipeline' && <Pipeline />}
         {screen === 'settings' && <Settings />}
-        {screen === 'setup' && <Setup />}
+        {screen === 'setup' && (
+          <Setup open onClose={() => setScreen('review')} onNavigate={(s) => setScreen(s as Screen)} />
+        )}
       </Suspense>
     </ErrorBoundary>
   );

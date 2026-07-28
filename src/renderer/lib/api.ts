@@ -221,6 +221,34 @@ export interface PatchCompanyVars {
   quiet?: boolean;
 }
 
+/**
+ * Keep the footer counters live during a review run without refetching the
+ * 5,000-row list. At 150 records/hour an invalidate-per-keystroke would refetch
+ * several MB every few seconds; the counters are derived from the same
+ * transition we already know about, so patch them directly.
+ */
+function bumpStats(
+  qc: QueryClient,
+  prev: { reviewed: boolean; status: string } | undefined,
+  next: { reviewed?: boolean; status?: string },
+): void {
+  if (!prev) return;
+  qc.setQueryData<DashboardStats>(qk.stats, (s) => {
+    if (!s) return s;
+    let { reviewed, approved } = s;
+    if (next.reviewed !== undefined && next.reviewed !== prev.reviewed) {
+      reviewed += next.reviewed ? 1 : -1;
+    }
+    if (next.status !== undefined && next.status !== prev.status) {
+      const wasApproved = prev.status === 'approved';
+      const isApproved = next.status === 'approved';
+      if (isApproved && !wasApproved) approved += 1;
+      if (!isApproved && wasApproved) approved -= 1;
+    }
+    return { ...s, reviewed: Math.max(0, reviewed), approved: Math.max(0, approved) };
+  });
+}
+
 export function usePatchCompany() {
   const qc = useQueryClient();
   return useMutation({
@@ -231,6 +259,8 @@ export function usePatchCompany() {
       const prevDetail = qc.getQueryData<CompanyDetail | null>(qk.company(id));
 
       const rp = rowPatch(patch);
+      const before = prevList?.find((r) => r.id === id);
+      bumpStats(qc, before && { reviewed: before.reviewed, status: before.status }, patch);
       qc.setQueryData<CompanyRow[]>(qk.companies, (rows) =>
         rows?.map((r) => (r.id === id ? { ...r, ...rp } : r)),
       );
@@ -242,6 +272,7 @@ export function usePatchCompany() {
     onError: (err, vars, ctx) => {
       if (ctx?.prevList) qc.setQueryData(qk.companies, ctx.prevList);
       if (ctx?.prevDetail !== undefined) qc.setQueryData(qk.company(vars.id), ctx.prevDetail);
+      void qc.invalidateQueries({ queryKey: qk.stats });
       if (!vars.quiet) {
         toast.error('Could not save', { description: String((err as Error).message ?? err) });
       }
@@ -271,6 +302,11 @@ export function useBulkCompanyStatus() {
     onError: (err, _vars, ctx) => {
       if (ctx?.prevList) qc.setQueryData(qk.companies, ctx.prevList);
       toast.error('Bulk update failed', { description: String((err as Error).message ?? err) });
+    },
+    // A bulk change can flip hundreds of rows at once, so deriving the counter
+    // deltas row-by-row buys nothing. The stats query is a handful of COUNTs.
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: qk.stats });
     },
   });
 }

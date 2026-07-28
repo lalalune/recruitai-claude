@@ -84,7 +84,8 @@ function createWindow(): void {
 
   if (isDev) {
     mainWindow.loadURL('http://localhost:5183');
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+    // Opt-in rather than automatic: RECRUITAI_DEVTOOLS=1 bun run dev
+    if (process.env.RECRUITAI_DEVTOOLS) mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
     mainWindow.loadURL('app://-/index.html');
   }
