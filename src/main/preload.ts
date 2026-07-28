@@ -10,6 +10,7 @@ const METHODS = [
   'getPipeline','runSource','runAll','stopPipeline','setSourceEnabled',
   'listDrafts','generateDraft','patchDraft','queueDraft','skipDraft','sendNow',
   'getSendStats','startSending','pauseSending','listInbound','markInbound','syncInbox',
+  'getLinkedInStatus','connectLinkedIn','disconnectLinkedIn',
   'getSettings','patchSettings','setSecret','testKey','connectGmail','disconnectGmail','testGmail',
   'listSuppressions','addSuppression','removeSuppression','importSuppressionsCsv',
   'getStats','exportCsv','backupNow','openDataDir','openExternal','getScreenshot',

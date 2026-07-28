@@ -2,19 +2,33 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import {
+  AlertTriangle,
   Download,
   FolderOpen,
+  LogIn,
   Mail,
   Plus,
   Save,
   Send,
+  Sparkles,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
-import type { Settings as SettingsShape, SettingsPatch, SuppressionRow } from '../../shared/ipc.js';
+import type {
+  Settings as SettingsShape,
+  SettingsPatch,
+  SuppressionRow,
+  LinkedInStatus,
+} from '../../shared/ipc.js';
 import { DEFAULT_ICP } from '../../shared/score.js';
-import { api } from '../lib/api.js';
+import {
+  api,
+  linkedInBlockedUntil,
+  useConnectLinkedIn,
+  useDisconnectLinkedIn,
+  useLinkedInStatus,
+} from '../lib/api.js';
 import { cn } from '../lib/utils.js';
 import { Section } from '../components/Section.js';
 import { StatusChip } from '../components/StatusChip.js';
@@ -427,6 +441,199 @@ export function IcpFields() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LinkedIn
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** What to do instead. Every one of these is free and carries no account risk. */
+const LINKEDIN_FALLBACKS: { label: string; detail: string }[] = [
+  {
+    label: 'Company team or about page',
+    detail:
+      'A startup with an in-house recruiter almost always lists them there, alongside the founders and the CTO.',
+  },
+  {
+    label: 'Job descriptions',
+    detail:
+      'An open “Recruiter” or “Talent Partner” req is definitive, and many descriptions name the hiring manager outright.',
+  },
+  {
+    label: 'HN “Who is hiring” posts',
+    detail: 'Usually signed by a founder or an engineering lead, with a direct reply address.',
+  },
+  {
+    label: 'SEC Form D filings',
+    detail: 'Officer and director names plus the funding date — free, authoritative, and current.',
+  },
+];
+
+function untilLabel(ms: number): string {
+  const at = new Date(ms);
+  const time = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return at.toDateString() === new Date().toDateString() ? time : `${time} tomorrow`;
+}
+
+function linkedInChip(
+  status: LinkedInStatus | undefined,
+  blockedUntil: number | null,
+): { label: string; tone: 'good' | 'warn' | 'bad' | 'muted' } {
+  if (!status) return { label: 'checking…', tone: 'muted' };
+  switch (status.state) {
+    case 'ready':
+      return { label: 'signed in', tone: 'good' };
+    case 'disabled':
+      return { label: 'disabled', tone: 'muted' };
+    case 'unsupported':
+      return { label: 'unavailable', tone: 'muted' };
+    case 'logged_out':
+      return { label: 'not signed in', tone: 'warn' };
+    case 'checkpoint':
+      return { label: 'checkpoint needs you', tone: 'bad' };
+    case 'blocked':
+      return {
+        label: blockedUntil ? `rate-limited until ${untilLabel(blockedUntil)}` : 'rate-limited',
+        tone: 'bad',
+      };
+    case 'budget_exhausted':
+      return { label: 'budget used for today', tone: 'warn' };
+    case 'outside_window':
+      return { label: 'outside active window', tone: 'muted' };
+    default:
+      return { label: status.loggedIn ? 'signed in' : 'not signed in', tone: 'muted' };
+  }
+}
+
+function LinkedInPanel({ settings }: { settings: SettingsShape }) {
+  const patch = useSettingsPatch();
+  const { data: status } = useLinkedInStatus();
+  const connect = useConnectLinkedIn();
+  const disconnect = useDisconnectLinkedIn();
+
+  const blockedUntil = linkedInBlockedUntil(status);
+  const chip = linkedInChip(status, blockedUntil);
+  const signedIn = Boolean(status?.loggedIn);
+  const checkpoint = status?.state === 'checkpoint';
+  const busy = connect.isPending || disconnect.isPending;
+
+  // Falls back to the configured budget so the readout is not blank on first paint.
+  const perDay = status?.budgetPerDay ?? settings.crawl.linkedinPerDay;
+  const used = status?.budgetUsed ?? 0;
+  const remaining = status?.budgetRemaining ?? Math.max(0, perDay - used);
+
+  return (
+    <div className="space-y-3 py-1">
+      {status?.needsOperator && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div>
+            <div className="font-medium">{status.message}</div>
+            <div className="mt-0.5">
+              {checkpoint
+                ? 'LinkedIn is holding this session at a security checkpoint. Open the window and clear it yourself — the app will not try to solve or bypass it, and it stays stopped until you do.'
+                : 'Sign in below. A real LinkedIn window opens and you log in there.'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="divide-y divide-border">
+        <Row label="Status" help={status?.message}>
+          <StatusChip label={chip.label} tone={chip.tone} />
+        </Row>
+
+        <Row
+          label="Session"
+          help="Opens a real LinkedIn window inside the app. You type your own credentials into LinkedIn's own page — the app never sees your password, and keeps only the session cookie."
+        >
+          {signedIn ? (
+            <>
+              {status?.needsOperator && (
+                <Button size="sm" onClick={() => connect.mutate()} disabled={busy}>
+                  <LogIn className="mr-1.5 h-3.5 w-3.5" />
+                  {connect.isPending ? 'Opening window…' : 'Open LinkedIn window'}
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => disconnect.mutate()}
+                disabled={busy}
+              >
+                {disconnect.isPending ? 'Signing out…' : 'Sign out'}
+              </Button>
+            </>
+          ) : (
+            <Button size="sm" onClick={() => connect.mutate()} disabled={busy}>
+              <LogIn className="mr-1.5 h-3.5 w-3.5" />
+              {connect.isPending ? 'Waiting for the window…' : 'Sign in to LinkedIn'}
+            </Button>
+          )}
+        </Row>
+
+        <Row
+          label="Today's budget"
+          help="Counted per calendar day and persisted, so restarting the app does not hand back a fresh allowance."
+        >
+          <span className="font-mono text-sm tabular-nums">
+            {used} / {perDay}
+          </span>
+          <span className="text-xs text-muted-foreground">
+            today, {remaining} remaining
+          </span>
+        </Row>
+
+        <Row label="Enabled" help="Off by default. Nothing touches LinkedIn while this is off.">
+          <Switch
+            checked={settings.crawl.linkedinEnabled}
+            onCheckedChange={(linkedinEnabled) => patch.mutate({ crawl: { linkedinEnabled } })}
+          />
+        </Row>
+
+        <Row
+          label="Requests per day"
+          help="The hard daily ceiling. Requests are also spaced randomly, so a low number here is genuinely low traffic."
+        >
+          <NumberInput
+            value={settings.crawl.linkedinPerDay}
+            min={0}
+            max={200}
+            suffix="/ day"
+            onCommit={(linkedinPerDay) => patch.mutate({ crawl: { linkedinPerDay } })}
+          />
+        </Row>
+      </div>
+
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        LinkedIn rate-limits aggressively. When it blocks or challenges this session the app stops
+        for the rest of the day rather than working around it. Sign in with an account you can
+        afford to lose, not the one your business depends on.
+      </p>
+
+      {/* -mx-3 cancels the parent Section's body padding so this nested header
+          lines up with the rows above it rather than stepping in. */}
+      <Section
+        title="If LinkedIn is unavailable"
+        storageKey="settings.linkedin.fallbacks"
+        defaultOpen={false}
+        className="-mx-3 border-b-0"
+      >
+        <p className="mb-2 text-xs leading-relaxed text-muted-foreground">
+          LinkedIn is the precision layer, not the foundation. These cover most of the same signal
+          at no account risk, and the pipeline already reads all four.
+        </p>
+        <ul className="space-y-2">
+          {LINKEDIN_FALLBACKS.map((f) => (
+            <li key={f.label}>
+              <div className="text-sm">{f.label}</div>
+              <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{f.detail}</div>
+            </li>
+          ))}
+        </ul>
+      </Section>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Screen
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -470,7 +677,10 @@ export function Settings() {
                   onCommit={(perHour) => patch.mutate({ sending: { perHour } })}
                 />
               </Row>
-              <Row label="Sends per day" help="Gmail's own hard limit is 500; staying under it protects the account.">
+              <Row
+                label="Sends per day"
+                help="150 is the recommended ceiling for a personal Gmail. Google's own hard limit is 500 a day, and sustained volume near it is what gets an account flagged."
+              >
                 <NumberInput
                   value={settings.sending.perDay}
                   min={1}
@@ -516,23 +726,11 @@ export function Settings() {
                   onCommit={(concurrency) => patch.mutate({ crawl: { concurrency } })}
                 />
               </Row>
-              <Row
-                label="LinkedIn"
-                help="Off by default. LinkedIn is rate-limited aggressively and a block is surfaced to you rather than worked around."
-              >
-                <NumberInput
-                  value={settings.crawl.linkedinPerDay}
-                  min={0}
-                  max={200}
-                  suffix="/ day"
-                  onCommit={(linkedinPerDay) => patch.mutate({ crawl: { linkedinPerDay } })}
-                />
-                <Switch
-                  checked={settings.crawl.linkedinEnabled}
-                  onCheckedChange={(linkedinEnabled) => patch.mutate({ crawl: { linkedinEnabled } })}
-                />
-              </Row>
             </div>
+          </Section>
+
+          <Section title="LinkedIn" defaultOpen>
+            <LinkedInPanel settings={settings} />
           </Section>
 
           <Section title="Ideal customer profile" defaultOpen>
@@ -687,6 +885,14 @@ function KeysPanel({ settings }: { settings: SettingsShape }) {
 
 function TemplatesPanel({ settings }: { settings: SettingsShape }) {
   const patch = useSettingsPatch();
+  const generateDrafts = useMutation({
+    mutationFn: () => api.runSource('draft_generation'),
+    onSuccess: () =>
+      toast.success('Draft generation started', {
+        description: 'Watch it in the pipeline panel. Finished drafts appear in Outreach.',
+      }),
+    onError: (e: Error) => toast.error('Could not start draft generation', { description: e.message }),
+  });
   const [templates, setTemplates] = useState<Record<string, string>>(() => readTemplates());
   const [band, setBand] = useState<TemplateBand>('band20_75');
   const [signature, setSignature] = useState(settings.sending.signature);
@@ -774,6 +980,20 @@ function TemplatesPanel({ settings }: { settings: SettingsShape }) {
             onCheckedChange={(includeOptOutLine) => patch.mutate({ sending: { includeOptOutLine } })}
           />
         </Row>
+        <Row
+          label="Generate drafts for approved companies"
+          help="Drafts are written by the draft generation pipeline step — approving a company in Review does not start one. Run this once you have a batch of approvals waiting; every approved company with a contact gets a draft you can still edit before it queues."
+        >
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => generateDrafts.mutate()}
+            disabled={generateDrafts.isPending}
+          >
+            <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+            {generateDrafts.isPending ? 'Starting…' : 'Generate drafts'}
+          </Button>
+        </Row>
       </div>
     </div>
   );
@@ -783,10 +1003,14 @@ function TemplatesPanel({ settings }: { settings: SettingsShape }) {
 
 const SUPPRESSION_REASONS = [
   { value: 'existing_client', label: 'Existing client' },
-  { value: 'competitor', label: 'Competitor' },
-  { value: 'no_agency', label: 'No-agency policy' },
+  { value: 'active_contract', label: 'Active contract' },
+  { value: 'past_rejection', label: 'Said no before' },
+  { value: 'placed_candidate_employer', label: 'Employs someone we placed' },
+  { value: 'competitor', label: 'Competitor agency' },
+  { value: 'no_agency_policy', label: 'No-agency policy' },
   { value: 'replied_no', label: 'Replied no' },
   { value: 'bounced', label: 'Bounced' },
+  { value: 'opt_out', label: 'Opted out' },
   { value: 'manual', label: 'Manual' },
 ];
 

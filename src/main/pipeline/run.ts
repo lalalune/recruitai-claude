@@ -16,6 +16,7 @@ import { ingestYc, ingestAtsSweep, ingestCareersCrawl, ingestHn, ingestSecFormD 
 import { scoreAll, recomputeCompany } from './scoring.js';
 import { generateAllDrafts } from './drafts.js';
 import * as linkedin from '../linkedin/index.js';
+import { ingestLinkedInUrls } from './ingest.js';
 import { discoverContacts, verifyCompanyContacts, upsertContact } from './contacts.js';
 import { observeCompany } from './ingest.js';
 import type { EventName, LogLine, PipelineState, RecruitEvents, SourceKey, SourceStatus } from '../../shared/ipc.js';
@@ -271,6 +272,15 @@ const SOURCES: Record<SourceKey, SourceDef> = {
     estimateCostUsd: () => null,
     run: ingestCareersCrawl,
   },
+  linkedin_urls: {
+    label: 'LinkedIn URL discovery',
+    description:
+      "Reads each company's own site for the LinkedIn page it links to. Required before LinkedIn enrichment can run — the slugs are usually not derivable from the domain.",
+    defaultEnabled: true,
+    requiresKey: null,
+    estimateCostUsd: () => null,
+    run: ingestLinkedInUrls,
+  },
   hn_whoishiring: {
     label: 'HN Who Is Hiring',
     description: 'Twelve months of threads; captures addresses the hiring party published itself.',
@@ -349,6 +359,7 @@ export const SOURCE_ORDER: SourceKey[] = [
   'yc',
   'ats_sweep',
   'careers_crawl',
+  'linkedin_urls',
   'hn_whoishiring',
   'sec_formd',
   'linkedin',

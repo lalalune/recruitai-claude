@@ -14,6 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { initDb, closeDb, getDb, backup } from './db/index.js';
 import { registerIpc } from './ipc/index.js';
 import { setPipelineWindow } from './pipeline/run.js';
+import { startDrainer, stopDrainer } from './pipeline/drain.js';
 
 const isDev = process.argv.includes('--dev') || !app.isPackaged;
 
@@ -148,6 +149,7 @@ app.whenReady().then(() => {
   createWindow();
   registerIpc(mainWindow!);
   setPipelineWindow(mainWindow);
+  startDrainer();
   rotatingBackup();
 
   app.on('activate', () => {
@@ -160,6 +162,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  stopDrainer();
   closeDb();
 });
 

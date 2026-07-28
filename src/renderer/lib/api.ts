@@ -31,6 +31,7 @@ import type {
   DraftRow,
   EventName,
   InboundRow,
+  LinkedInStatus,
   PipelineState,
   RecruitApi,
   RecruitEvents,
@@ -119,6 +120,7 @@ export const qk = {
   inbound: (handled?: boolean) => ['inbound', handled ?? 'all'] as const,
   settings: ['settings'] as const,
   suppressions: ['suppressions'] as const,
+  linkedin: ['linkedin', 'status'] as const,
   screenshot: (relPath: string) => ['screenshot', relPath] as const,
 };
 
@@ -539,6 +541,73 @@ export function useRunSource() {
       }),
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LinkedIn
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+
+// The proxy forwards any method name straight to the preload, so this is a
+// type-level statement only. It exists because RecruitApi does not declare the
+// three LinkedIn methods yet, and remains correct once it does.
+
+/**
+ * When the stop expires. The main side halts for the remainder of the local day
+ * rather than for a fixed duration, so this derives the release time from the
+ * halt timestamp's next midnight.
+ */
+export function linkedInBlockedUntil(status: LinkedInStatus | undefined): number | null {
+  if (!status) return null;
+  if (typeof status.haltAt === 'number') {
+    const midnight = new Date(status.haltAt);
+    midnight.setHours(24, 0, 0, 0);
+    return midnight.getTime();
+  }
+  return null;
+}
+
+/**
+ * Fast polling only while something is actually moving: the operator is in the
+ * login window, a checkpoint is waiting, or the pipeline is spending budget.
+ * Disabled, blocked and exhausted are settled states — nothing changes until
+ * the operator or the calendar does.
+ */
+function linkedInInFlight(status: LinkedInStatus | undefined): boolean {
+  return !status || status.needsOperator || status.state === 'ready';
+}
+
+export function useLinkedInStatus() {
+  return useQuery<LinkedInStatus>({
+    queryKey: qk.linkedin,
+    queryFn: () => api.getLinkedInStatus(),
+    refetchInterval: (query) => (linkedInInFlight(query.state.data) ? 5_000 : 30_000),
+    staleTime: 2_000,
+  });
+}
+
+/** The pipeline's LinkedIn steps become runnable or not, so it is invalidated too. */
+function useLinkedInSession(run: () => Promise<LinkedInStatus>, failure: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: run,
+    onSuccess: (status) => {
+      qc.setQueryData(qk.linkedin, status);
+      void qc.invalidateQueries({ queryKey: qk.pipeline });
+    },
+    onError: (err) => toast.error(failure, { description: String((err as Error).message ?? err) }),
+  });
+}
+
+export function useConnectLinkedIn() {
+  return useLinkedInSession(() => api.connectLinkedIn(), 'LinkedIn sign-in failed');
+}
+
+export function useDisconnectLinkedIn() {
+  return useLinkedInSession(() => api.disconnectLinkedIn(), 'Could not sign out of LinkedIn');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export function useInbound(handled?: boolean) {
   return useQuery<InboundRow[]>({

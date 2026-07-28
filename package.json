@@ -22,9 +22,10 @@
     "dist:win": "bun run build && electron-builder --win --publish never",
     "dist:linux": "bun run build && electron-builder --linux --publish never",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types src/**/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
     "seed": "esbuild scripts/seed.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --log-level=error --outfile=dist/seed.cjs && node dist/seed.cjs",
-    "smoke": "esbuild scripts/smoke.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --log-level=error --outfile=dist/smoke.cjs && node dist/smoke.cjs"
+    "smoke": "esbuild scripts/smoke.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --log-level=error --outfile=dist/smoke.cjs && node dist/smoke.cjs",
+    "test:watch": "node --watch scripts/run-tests.mjs"
   },
   "dependencies": {
     "@googleapis/gmail": "17.0.0",

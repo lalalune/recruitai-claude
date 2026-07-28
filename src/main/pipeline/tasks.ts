@@ -153,14 +153,6 @@ export function taskCounts(db: Db): Record<TaskRow['state'], number> {
   return out;
 }
 
-export function purgeFinished(db: Db, olderThanMs = 7 * 86_400_000): number {
-  const rows = all<{ id: number }>(
-    db,
-    `DELETE FROM task WHERE state = 'done' AND COALESCE(finished_at, created_at) < ? RETURNING id`,
-    Date.now() - olderThanMs,
-  );
-  return rows.length;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cost ledger — reserve then commit
@@ -303,9 +295,6 @@ export function spendByProvider(db: Db): { provider: string; spentUsd: number; c
   }));
 }
 
-export function currentDb(): Db {
-  return getDb();
-}
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;

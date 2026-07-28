@@ -354,7 +354,7 @@ function DraftsTab({ active }: { active: boolean }) {
         <EmptyState
           icon={<Mail className="h-6 w-6" />}
           title={isLoading ? 'Loading drafts…' : 'No drafts waiting'}
-          description="Drafts are generated in the background as soon as you approve a company in Review."
+          description="Approving a company in Review queues its first draft; it appears here within a few seconds."
         />
       }
     />
@@ -606,7 +606,7 @@ function QueueTab() {
               </QueueSetting>
               <QueueSetting label="Sends per day">
                 <NumberBox
-                  value={settings?.sending.perDay ?? 400}
+                  value={settings?.sending.perDay ?? 150}
                   min={1}
                   max={500}
                   onCommit={(perDay) => patch.mutate({ sending: { perDay } })}

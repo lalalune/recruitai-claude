@@ -62,10 +62,23 @@ const BAY_AREA_MARKERS = [
   'san rafael', 'walnut creek', 'pleasanton', 'san bruno', 'daly city',
 ];
 
+/**
+ * Same-named places outside California. Checked before the city markers,
+ * because "San Jose, Costa Rica" contains the "san jose" marker.
+ */
+const NON_CA_HOMONYMS = [
+  'costa rica', 'philippines', ', ny', ', va', ', tx', ', il', ', mi',
+  'new york', 'virginia', 'texas', 'michigan', 'indiana',
+];
+
 export function isBayArea(location: string | null | undefined): boolean {
   if (!location) return false;
   const l = location.toLowerCase();
-  return BAY_AREA_MARKERS.some((m) => l.includes(m));
+  if (!BAY_AREA_MARKERS.some((m) => l.includes(m))) return false;
+  // An explicit California marker outranks a homonym, since "San Jose, CA, USA;
+  // Manila, Philippines" is a real multi-office string we want to keep.
+  if (/\b(ca|california)\b/.test(l)) return true;
+  return !NON_CA_HOMONYMS.some((h) => l.includes(h));
 }
 
 export function filterYcIcp(
@@ -158,6 +171,9 @@ function decodeHnText(html: string): string {
     .trim();
 }
 
+/** Asset filenames that satisfy the email grammar (e.g. "logo@2x.png"). */
+const ASSET_EXT_RE = /\.(png|jpe?g|gif|webp|svg|avif|ico|bmp|tiff?|css|js|mjs|woff2?|ttf|eot|pdf|mp4|webm)$/i;
+
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const URL_RE = /https?:\/\/[^\s<>"')]+/g;
 
@@ -167,7 +183,9 @@ export function extractEmails(text: string): string[] {
     ...new Set(
       found
         .map((e) => e.toLowerCase().replace(/[.,;:)\]]+$/, ''))
-        .filter((e) => !e.endsWith('.png') && !e.endsWith('.jpg')),
+        // "logo@2x.png" and friends match the address grammar. Anything whose
+        // TLD is an asset extension is a filename, not a person.
+        .filter((e) => !ASSET_EXT_RE.test(e)),
     ),
   ];
 }

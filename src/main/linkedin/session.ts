@@ -645,7 +645,7 @@ export async function getStatus(): Promise<LinkedInStatus> {
 
   if (!hasElectron) return make('unsupported', 'LinkedIn needs the Electron main process.');
   if (!hasDb) return make('unsupported', 'Database not open — the daily budget cannot be enforced.');
-  if (!enabled) return make('disabled', 'LinkedIn is off. Enable it in Settings → Rate limits.');
+  if (!enabled) return make('disabled', 'LinkedIn is off. Turn on “Enabled” below to use it.');
   if (halt) {
     const state: LinkedInState = halt.kind === 'checkpoint' ? 'checkpoint' : 'blocked';
     return make(state, `${halt.reason} — stopped for the rest of today.`, halt.kind === 'checkpoint');

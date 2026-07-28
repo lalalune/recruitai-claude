@@ -183,6 +183,7 @@ export type SourceKey =
   | 'yc'
   | 'ats_sweep'
   | 'careers_crawl'
+  | 'linkedin_urls'
   | 'hn_whoishiring'
   | 'sec_formd'
   | 'linkedin'
@@ -204,6 +205,27 @@ export interface SourceStatus {
   /** Non-null means running it will spend money. */
   estimatedCostUsd: number | null;
   requiresKey: string | null;
+}
+
+export interface LinkedInStatus {
+  state: string;
+  available: boolean;
+  enabled: boolean;
+  loggedIn: boolean;
+  message: string;
+  /** True when only the operator can clear it (sign in, resolve a checkpoint). */
+  needsOperator: boolean;
+  day: string;
+  budgetPerDay: number;
+  budgetUsed: number;
+  budgetRemaining: number;
+  /** Epoch ms; the spacing gate will not release a request before this. */
+  nextRequestNotBefore: number | null;
+  haltReason: string | null;
+  haltAt: number | null;
+  windowStart: string;
+  windowEnd: string;
+  inWindow: boolean;
 }
 
 export interface PipelineState {
@@ -381,6 +403,11 @@ export interface RecruitApi {
   listInbound(handled?: boolean): Promise<InboundRow[]>;
   markInbound(id: string, action: 'positive' | 'negative' | 'bounce' | 'ignore'): Promise<void>;
   syncInbox(): Promise<number>;
+
+  // linkedin
+  getLinkedInStatus(): Promise<LinkedInStatus>;
+  connectLinkedIn(): Promise<LinkedInStatus>;
+  disconnectLinkedIn(): Promise<LinkedInStatus>;
 
   // settings
   getSettings(): Promise<Settings>;

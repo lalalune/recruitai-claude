@@ -23,6 +23,7 @@ import {
   extractEmails,
   type YcCompany,
 } from '../sources/seeds.js';
+import { findCompanyLinkedIn } from '../sources/social.js';
 import { probeAts, AllPlatformsBlockedError, ATS_FETCHERS } from '../sources/ats.js';
 import { classifyNoAgency, classifyFunctionFamily, classifySeniority } from './scoring.js';
 import { getIcp, getCrawl } from '../settings.js';
@@ -927,6 +928,66 @@ function boardUrl(board: AtsBoard): string {
     default:
       return board.token;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Source: company LinkedIn URL discovery
+//
+// The LinkedIn enrichment source is keyed on company.linkedin_url and nothing
+// else produces one, so without this step that whole feature has no targets.
+// Slugs are frequently not derivable from the domain (sift.com -> getsift), so
+// this reads the company's own site rather than guessing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function ingestLinkedInUrls(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
+  const crawl = getCrawl();
+  const targets = all<{ id: string; name: string; website: string }>(
+    db,
+    `SELECT id, name, website FROM company
+      WHERE canonical_id IS NULL
+        AND (linkedin_url IS NULL OR linkedin_url = '')
+        AND website IS NOT NULL AND website != ''
+      ORDER BY quality_score DESC NULLS LAST, open_req_count DESC`,
+  );
+
+  if (targets.length === 0) return { records: 0, message: 'Every company already has a LinkedIn URL' };
+
+  ctx.log('info', `Reading ${targets.length} company sites for their LinkedIn page…`);
+  ctx.progress(0, targets.length);
+
+  const found: { id: string; url: string; foundAt: string }[] = [];
+  let flushed = 0;
+
+  const flush = () => {
+    if (found.length === 0) return;
+    const batch = found.splice(0, found.length);
+    tx(db, () => {
+      for (const f of batch) {
+        const evidenceId = storeRaw(db, 'careers_page', f.foundAt, 200, f.url);
+        observeCompany(db, f.id, 'linkedinUrl', f.url, 'careers_page', evidenceId, 'high');
+      }
+    });
+    flushed += batch.length;
+  };
+
+  await mapLimit(
+    targets,
+    Math.max(2, Math.floor(crawl.concurrency / 2)),
+    async (target) => {
+      if (ctx.cancelled()) return null;
+      const profile = await findCompanyLinkedIn(target.website);
+      if (profile) {
+        found.push({ id: target.id, url: profile.linkedinUrl, foundAt: profile.foundAt });
+        if (found.length >= 25) flush();
+      }
+      return null;
+    },
+    { jitterMs: 150, onProgress: (done, total) => ctx.progress(done, total) },
+  );
+
+  flush();
+  ctx.log('info', `${flushed} LinkedIn company URLs resolved.`);
+  return { records: flushed, message: `${flushed} LinkedIn URLs from ${targets.length} sites` };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

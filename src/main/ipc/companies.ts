@@ -22,6 +22,8 @@ import {
   etldPlusOne,
 } from '../pipeline/ingest.js';
 import { recomputeCompany, electPrimaryContact } from '../pipeline/scoring.js';
+import { enqueue } from '../pipeline/tasks.js';
+import { TASK_GENERATE_DRAFT } from '../pipeline/drain.js';
 import { emitEvent } from '../pipeline/run.js';
 import { discoverContacts, verifyContactById } from '../pipeline/contacts.js';
 import type {
@@ -451,6 +453,13 @@ export function patchCompany(db: Db, id: string, patch: CompanyPatch): CompanyDe
           const status = String(value);
           if (!COMPANY_STATUSES.has(status)) throw new Error(`Invalid company status: ${status}`);
           run(db, 'UPDATE company SET status = ?, updated_at = ? WHERE id = ?', status, Date.now(), companyId);
+          // Approving is what makes a company draftable. Enqueue rather than
+          // generate inline: drafting may call an LLM, and the approve keystroke
+          // is the hot path of the review loop. dedupe_key keeps repeated
+          // approve/unapprove from stacking duplicate work.
+          if (status === 'approved') {
+            enqueue(db, TASK_GENERATE_DRAFT, { companyId }, { dedupeKey: companyId, priority: 50 });
+          }
         } else if (key === 'reviewed') {
           const reviewed = value === true ? 1 : 0;
           run(
@@ -517,6 +526,12 @@ export function bulkCompanyStatus(db: Db, ids: string[], status: string): number
   });
 
   emitEvent('data:changed', { entity: 'company' });
+  if (status === 'approved') {
+    for (const id of ids) {
+      enqueue(db, TASK_GENERATE_DRAFT, { companyId: id }, { dedupeKey: id, priority: 50 });
+    }
+  }
+
   return changed;
 }
 

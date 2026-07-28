@@ -14,6 +14,7 @@ import { setPipelineWindow, recoverAfterRestart, appendLog } from '../pipeline/r
 import { registerCompanyIpc } from './companies.js';
 import { registerPipelineIpc } from './pipeline.js';
 import { registerOutreachIpc, reconcileInterruptedSends, pauseSending } from './outreach.js';
+import { registerLinkedInIpc } from './linkedin.js';
 import { registerSettingsIpc } from './settings.js';
 
 /** Mirrors the METHODS list in preload.ts. Kept explicit so both sides drift loudly. */
@@ -23,6 +24,7 @@ const CHANNELS = [
   'getPipeline', 'runSource', 'runAll', 'stopPipeline', 'setSourceEnabled',
   'listDrafts', 'generateDraft', 'patchDraft', 'queueDraft', 'skipDraft', 'sendNow',
   'getSendStats', 'startSending', 'pauseSending', 'listInbound', 'markInbound', 'syncInbox',
+  'getLinkedInStatus', 'connectLinkedIn', 'disconnectLinkedIn',
   'getSettings', 'patchSettings', 'setSecret', 'testKey', 'connectGmail', 'disconnectGmail', 'testGmail',
   'listSuppressions', 'addSuppression', 'removeSuppression', 'importSuppressionsCsv',
   'getStats', 'exportCsv', 'backupNow', 'openDataDir', 'openExternal', 'getScreenshot',
@@ -40,6 +42,7 @@ export function registerIpc(win: BrowserWindow): void {
   registerCompanyIpc();
   registerPipelineIpc();
   registerOutreachIpc();
+  registerLinkedInIpc();
   registerSettingsIpc();
 
   if (!registered) {

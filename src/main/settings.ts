@@ -45,7 +45,7 @@ export const DEFAULT_SETTINGS = {
   },
   sending: {
     perHour: 20,
-    perDay: 400,
+    perDay: 150,
     windowStart: '09:00',
     windowEnd: '17:00',
     jitterPct: 40,
@@ -159,7 +159,7 @@ export function getSending(): (typeof DEFAULT_SETTINGS)['sending'] {
   const s = readGroup('sending');
   return {
     perHour: clampInt(s.perHour, 1, 200, DEFAULT_SETTINGS.sending.perHour),
-    perDay: clampInt(s.perDay, 1, 2000, DEFAULT_SETTINGS.sending.perDay),
+    perDay: clampInt(s.perDay, 1, 500, DEFAULT_SETTINGS.sending.perDay),
     windowStart: isClock(s.windowStart) ? s.windowStart : DEFAULT_SETTINGS.sending.windowStart,
     windowEnd: isClock(s.windowEnd) ? s.windowEnd : DEFAULT_SETTINGS.sending.windowEnd,
     jitterPct: clampInt(s.jitterPct, 0, 90, DEFAULT_SETTINGS.sending.jitterPct),
