@@ -161,6 +161,39 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ANALYZE field_observation;
     `,
   },
+  {
+    // Suppression lookups became bare index seeks (`s.value = lower(?)`), which
+    // turns lowercase from a convention into a correctness invariant: a row
+    // stored with any uppercase silently suppresses NOTHING. That fails open —
+    // the operator emails an existing client while the table says they should
+    // not have. addSuppressionRow canonicalises, but a CSV import or any future
+    // writer bypasses it, so enforce it in the schema rather than trusting every
+    // call site. SQLite cannot add a CHECK to an existing table, so rebuild.
+    version: 6,
+    sql: `
+      CREATE TABLE suppression_v6 (
+        id         INTEGER PRIMARY KEY,
+        kind       TEXT NOT NULL CHECK (kind IN ('domain','email','company')),
+        value      TEXT NOT NULL CHECK (value = lower(value)),
+        reason     TEXT NOT NULL
+                     CHECK (reason IN ('existing_client','active_contract','past_rejection',
+                                       'placed_candidate_employer','competitor','no_agency_policy',
+                                       'replied_no','bounced','manual','opt_out')),
+        note       TEXT,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch('subsec')*1000),
+        UNIQUE (kind, value)
+      ) STRICT;
+
+      -- lower() again rather than trusting the v3 backfill: a row inserted since
+      -- then by a path that skipped canonicalisation would otherwise abort this.
+      -- OR IGNORE because two rows differing only in case collapse to one here.
+      INSERT OR IGNORE INTO suppression_v6 (id, kind, value, reason, note, created_at)
+        SELECT id, kind, lower(value), reason, note, created_at FROM suppression;
+
+      DROP TABLE suppression;
+      ALTER TABLE suppression_v6 RENAME TO suppression;
+    `,
+  },
 ];
 
 /** The newest schema this build knows how to produce and read. */

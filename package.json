@@ -30,7 +30,8 @@
     "test:watch": "node --watch-path=tests --watch-path=src scripts/run-tests.mjs",
     "build:main:index": "esbuild src/main/index.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --outfile=dist/main/index.cjs",
     "build:main:preload": "esbuild src/main/preload.ts --bundle --platform=node --format=cjs --target=node24 --external:electron --outfile=dist/main/preload.cjs",
-    "licenses": "node scripts/gen-third-party.mjs"
+    "licenses": "node scripts/gen-third-party.mjs",
+    "repair": "esbuild scripts/repair.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --log-level=error --outfile=dist/repair.cjs && node dist/repair.cjs"
   },
   "dependencies": {
     "@googleapis/gmail": "17.0.0",

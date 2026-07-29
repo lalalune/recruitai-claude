@@ -171,11 +171,16 @@ export interface SpendState {
 export const GLOBAL_CAP_PROVIDER = 'all';
 
 export function syncSpendCap(db: Db, provider: string, capMicros: number): SpendState {
+  // Must UPDATE, not DO NOTHING. commitApiCall seeds a row for an unseen
+  // provider with cap_usd_micros = 0 (it knows the spend, not the ceiling), so
+  // a first charge that lands before this runs would otherwise pin the cap at
+  // zero forever — the Pipeline screen then reports a $0 budget against real
+  // spend. Setting the cap is precisely this function's job.
   run(
     db,
     `INSERT INTO spend_cap (provider, cap_usd_micros, spent_usd_micros)
      VALUES (?, ?, 0)
-     ON CONFLICT(provider) DO NOTHING`,
+     ON CONFLICT(provider) DO UPDATE SET cap_usd_micros = excluded.cap_usd_micros`,
     provider,
     capMicros,
   );

@@ -39,6 +39,27 @@ export interface HttpResponse {
 export const USER_AGENT =
   'recruitAI/0.1 (+https://github.com/lalalune/recruitai-claude; local research tool)';
 
+/**
+ * Hosts the crawler must never be redirected onto.
+ *
+ * Company websites are attacker-controlled from our point of view, and the
+ * crawler follows their redirects. A site that 302s to http://127.0.0.1:11434/
+ * or to link-local metadata would have its response body regex-scanned and
+ * stored in raw_response, where the evidence viewer renders it. Nothing we
+ * legitimately fetch lives on a private network, so refusing is free.
+ */
+const PRIVATE_HOST_RE =
+  /^(localhost|127\.|0\.|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|\[?fc|\[?fd|\[?fe80)/i;
+
+export function isPrivateHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h === '::1' || h.endsWith('.localhost') || h.endsWith('.internal')) return true;
+  return PRIVATE_HOST_RE.test(hostname.toLowerCase());
+}
+
+/** Max hops before we call it a loop. Matches the fetch default. */
+const MAX_REDIRECTS = 5;
+
 const DEFAULT_TIMEOUT = 20_000;
 const DEFAULT_MAX_BYTES = 40 * 1024 * 1024;
 
@@ -108,13 +129,41 @@ export async function httpRequest(
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const res = await fetch(url, {
-        method,
-        headers: { 'User-Agent': USER_AGENT, Accept: 'application/json, text/html;q=0.9', ...headers },
-        body,
-        signal: controller.signal,
-        redirect: 'follow',
-      });
+      // Manual redirect following: 'follow' would hand us the final body with
+      // no chance to inspect the hops. See isPrivateHost.
+      let current = url;
+      let res: Response | undefined;
+      for (let hop = 0; ; hop++) {
+        if (isPrivateHost(new URL(current).hostname)) {
+          clearTimeout(timer);
+          return {
+            ok: false,
+            status: 0,
+            body: '',
+            url,
+            fetchedAt: new Date().toISOString(),
+            error: `Refused to fetch a private/loopback address (${new URL(current).hostname}).`,
+          };
+        }
+        res = await fetch(current, {
+          method,
+          headers: { 'User-Agent': USER_AGENT, Accept: 'application/json, text/html;q=0.9', ...headers },
+          body,
+          signal: controller.signal,
+          redirect: 'manual',
+        });
+        const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
+        if (!location) break;
+        if (hop >= MAX_REDIRECTS) {
+          clearTimeout(timer);
+          return {
+            ok: false, status: res.status, body: '', url,
+            fetchedAt: new Date().toISOString(),
+            error: `Too many redirects (>${MAX_REDIRECTS}).`,
+          };
+        }
+        current = new URL(location, current).toString();
+      }
 
       const fetchedAt = new Date().toISOString();
 

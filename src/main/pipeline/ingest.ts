@@ -568,7 +568,7 @@ export function upsertReqs(
         companyId,
         externalId,
         source,
-        job.title.trim(),
+        normaliseTitle(job.title),
         job.department ?? null,
         job.team ?? null,
         job.location ?? null,
@@ -604,7 +604,7 @@ export function upsertReqs(
                         function_family = ?, seniority = ?, no_agency_disclaimer = ?,
                         named_contact = COALESCE(?, named_contact)
           WHERE id = ?`,
-        job.title.trim(),
+        normaliseTitle(job.title),
         job.department ?? null,
         job.team ?? null,
         job.location ?? null,
@@ -760,6 +760,16 @@ function humaniseLocalPart(local: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 // Source: Y Combinator directory
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Titles are interpolated into email prose, so interior whitespace matters:
+ * a scraped title containing newlines would inject free-standing paragraphs
+ * into a message sent from the operator's own mailbox. Length is bounded for
+ * the same reason — a 2,000-character "title" is not a title.
+ */
+function normaliseTitle(title: string): string {
+  return title.replace(/\s+/g, ' ').trim().slice(0, 200);
+}
 
 export async function ingestYc(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
   const icp = getIcp();

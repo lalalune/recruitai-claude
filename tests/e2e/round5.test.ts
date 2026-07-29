@@ -313,6 +313,24 @@ describe('round5 migration v3', () => {
              DROP INDEX field_observation_evidence; DROP INDEX api_call_spend;
              DROP INDEX raw_source_url;
              DROP INDEX contact_email_domain; DROP INDEX fo_email_domain;`);
+    // v6 added CHECK (value = lower(value)) to suppression, so the table has to
+    // be rewound too — otherwise the uppercase row this test exists to plant is
+    // rejected on insert and v3's backfill is never actually exercised.
+    v2.exec(`
+      DROP TABLE suppression;
+      CREATE TABLE suppression (
+        id         INTEGER PRIMARY KEY,
+        kind       TEXT NOT NULL CHECK (kind IN ('domain','email','company')),
+        value      TEXT NOT NULL,
+        reason     TEXT NOT NULL
+                     CHECK (reason IN ('existing_client','active_contract','past_rejection',
+                                       'placed_candidate_employer','competitor','no_agency_policy',
+                                       'replied_no','bounced','manual','opt_out')),
+        note       TEXT,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch('subsec')*1000),
+        UNIQUE (kind, value)
+      ) STRICT;
+    `);
     run(
       v2,
       `INSERT INTO suppression (kind, value, reason, created_at) VALUES ('domain', 'ACME.EXAMPLE', 'manual', ?)`,
