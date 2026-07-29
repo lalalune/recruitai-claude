@@ -115,6 +115,46 @@ function pressKey(win: BrowserWindow, keyCode: string): void {
   win.webContents.sendInputEvent({ type: 'keyUp', keyCode });
 }
 
+/**
+ * Press a key until its observable effect lands. On xvfb (Linux CI) the first
+ * keystroke after a reload can be swallowed while focus settles — a one-shot
+ * press followed by a poll loop then times out with the app fully healthy.
+ * Re-sending is safe ONLY for keys whose repeat is absorbed by the predicate
+ * (j/k clamp at the list edges; a re-press guard is separate) — the key is
+ * re-sent about once a second until the predicate holds.
+ */
+async function pressUntil<T>(
+  win: BrowserWindow,
+  keyCode: string,
+  what: string,
+  ms: number,
+  predicate: () => Promise<T | null | undefined>,
+): Promise<T> {
+  const deadline = Date.now() + ms;
+  let lastErr: unknown = null;
+  let sinceSend = 0;
+  pressKey(win, keyCode);
+  for (;;) {
+    try {
+      const got = await predicate();
+      if (got !== null && got !== undefined) return got;
+      lastErr = null;
+    } catch (err) {
+      lastErr = err;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for ${what}${lastErr ? ` (last error: ${lastErr})` : ''}`);
+    }
+    sinceSend += 1;
+    if (sinceSend >= 10) {
+      sinceSend = 0;
+      win.webContents.focus();
+      pressKey(win, keyCode);
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 const selectedName = (win: BrowserWindow) =>
   win.webContents.executeJavaScript(
     `document.querySelector('h1[data-selectable]')?.textContent ?? null`,
@@ -162,6 +202,8 @@ async function main(): Promise<void> {
     reloaded,
     new Promise((_, reject) => setTimeout(() => reject(new Error('reload did not finish in 15s')), 15_000)),
   ]);
+  win.show();
+  win.focus();
   win.webContents.focus();
 
   // The seeded list must actually render.
@@ -177,23 +219,27 @@ async function main(): Promise<void> {
   if (!names.includes(first)) fail(`initial selection "${first}" is not a seeded company`);
   else ok(`initial selection: ${first}`);
 
-  // j — move down. Real keystroke, real hotkey handler, real store.
-  pressKey(win, 'j');
-  const second = await waitFor('selection moved after j', 5_000, async () => {
+  // j — move down. Real keystroke, real hotkey handler, real store. j clamps
+  // at the bottom of the list, so a re-sent press cannot break the predicate.
+  const second = await pressUntil(win, 'j', 'selection moved after j', 15_000, async () => {
     const now = await selectedName(win);
     return now && now !== first ? now : undefined;
   });
   ok(`j moved selection: ${first} → ${second}`);
 
-  pressKey(win, 'k');
-  await waitFor('k moved selection back', 5_000, async () =>
-    (await selectedName(win)) === first || undefined,
+  // k clamps at the top — same re-send safety.
+  await pressUntil(win, 'k', 'k moved selection back', 15_000, async () =>
+    (await selectedName(win)) === first ? true : undefined,
   );
   ok('k moved selection back');
 
-  // a — approve the selected company. Verify the DATABASE, not just pixels.
-  pressKey(win, 'j');
-  const target = await waitFor('target selected', 5_000, () => selectedName(win));
+  // Move off the first row again and read the ACTUAL selection as the target.
+  // (An extra re-sent j can land on the third row; either is a valid target —
+  // what matters is that `a` approves the row the screen says is selected.)
+  const target = await pressUntil(win, 'j', 'selection moved off the first row', 15_000, async () => {
+    const now = await selectedName(win);
+    return now && now !== first ? now : undefined;
+  });
   pressKey(win, 'a');
 
   // A second WAL connection for verification — the app's own handle lives in
@@ -204,11 +250,22 @@ async function main(): Promise<void> {
   // The app's connection carries busy_timeout 5000; a probe without one can
   // throw SQLITE_BUSY during a WAL checkpoint and fail the run spuriously.
   probe.exec('PRAGMA busy_timeout = 5000');
-  await waitFor(`"${target}" approved in the database`, 5_000, () => {
+  // Guarded re-press: `a` approves AND advances, so a blind re-send could
+  // approve a second company. Only re-press while the selection still shows
+  // the target — once it has advanced, the press provably landed and the
+  // remaining wait is just the DB write becoming visible to the probe.
+  let aPolls = 0;
+  await waitFor(`"${target}" approved in the database`, 15_000, async () => {
     const row = probe
       .prepare(`SELECT status FROM company WHERE name = ?`)
       .get(target) as { status: string } | undefined;
-    return row?.status === 'approved' || undefined;
+    if (row?.status === 'approved') return true;
+    aPolls += 1;
+    if (aPolls % 10 === 0 && (await selectedName(win)) === target) {
+      win.webContents.focus();
+      pressKey(win, 'a');
+    }
+    return undefined;
   });
   ok(`a approved "${target}" — status row confirms it`);
 
@@ -242,16 +299,26 @@ async function main(): Promise<void> {
   ok('Outreach Drafts tab lists the generated draft');
 
   const modifier = process.platform === 'darwin' ? 'meta' : 'control';
-  win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter', modifiers: [modifier] });
-  win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: [modifier] });
+  const pressQueueChord = () => {
+    win.webContents.focus();
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter', modifiers: [modifier] });
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: [modifier] });
+  };
+  pressQueueChord();
 
-  await waitFor('the draft reaches the queue', 10_000, () => {
+  // Re-press guard: queueing a still-unqueued draft is idempotent, so if the
+  // chord was swallowed (xvfb focus settling) it is simply sent again.
+  let queuePolls = 0;
+  await waitFor('the draft reaches the queue', 15_000, () => {
     const row = probe
       .prepare(
         `SELECT d.state FROM draft d JOIN company co ON co.id = d.company_id WHERE co.name = ?`,
       )
       .get(target) as { state: string } | undefined;
-    return row?.state === 'queued' || undefined;
+    if (row?.state === 'queued') return true;
+    queuePolls += 1;
+    if (queuePolls % 10 === 0) pressQueueChord();
+    return undefined;
   });
   ok('⌘/Ctrl+Enter queued the draft — state and schedule confirmed in the database');
 
@@ -260,6 +327,7 @@ async function main(): Promise<void> {
   else fail(`send stats report ${sendStats.queued} queued — expected at least 1`);
   probe.close();
   server.close();
+  cleanup();
 
   if (failures.length) {
     console.error(`\nLOOP TEST FAILED (${failures.length})`);
@@ -270,17 +338,21 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error('✗ loop harness crashed:', err);
-  app.exit(1);
-});
-
-// Cleanup on BOTH verdicts: a thrown waitFor used to jump straight past the
-// rmSync and leak the tmpdir (ephemeral on CI, accumulating locally).
-app.on('will-quit', () => {
+// Cleanup on BOTH verdicts. Explicit rather than a will-quit hook: app.exit()
+// quits WITHOUT emitting will-quit, so a hook there never runs on any path
+// this harness actually takes.
+function cleanup(): void {
   try {
     if (cleanupDir) fs.rmSync(cleanupDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   } catch {
     /* best effort — a leaked tmpdir must not mask the real verdict */
   }
-});
+}
+
+main()
+  .catch((err) => {
+    console.error('✗ loop harness crashed:', err);
+    cleanup();
+    app.exit(1);
+  })
+  .finally(() => cleanup());

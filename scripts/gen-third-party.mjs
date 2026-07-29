@@ -41,12 +41,26 @@ function packageDirs(root) {
 }
 
 const pkgs = [];
+const platformGated = [];
 for (const dir of packageDirs(ROOT)) {
   const manifest = join(dir, 'package.json');
   if (!existsSync(manifest)) continue;
   let m;
   try { m = JSON.parse(readFileSync(manifest, 'utf8')); } catch { continue; }
   if (!m.name) continue;
+
+  // Platform-gated packages differ between a macOS dev machine and a Linux CI
+  // runner, which would make this file non-deterministic and fail the staleness
+  // check on every release. They are also native build tooling (esbuild,
+  // lightningcss, rolldown, tailwind oxide, fsevents) that runs at build time
+  // and is never bundled into the shipped app — the main process is one esbuild
+  // bundle and the renderer is a Vite bundle, so neither carries a .node binary.
+  // Excluding them keeps the file both reproducible and accurate about what we
+  // actually distribute.
+  if (m.os || m.cpu) {
+    platformGated.push(`${m.name}@${m.version ?? ''}`);
+    continue;
+  }
 
   const license =
     typeof m.license === 'string' ? m.license
@@ -87,6 +101,14 @@ lines.push('and any NOTICE files they ship are propagated verbatim, as Apache-2.
 lines.push('§4(d) require.');
 lines.push('');
 lines.push(`Generated from the installed dependency tree by \`bun run licenses\`. ${pkgs.length} packages.`);
+lines.push('');
+lines.push(
+  'Packages that declare an `os` or `cpu` constraint are omitted: they are native build ' +
+  'tooling that differs per platform and is never bundled into the shipped application ' +
+  '(the main process is a single esbuild bundle, the renderer a Vite bundle, and neither ' +
+  'carries a native addon). Omitting them also keeps this file reproducible across ' +
+  'developer machines and CI.',
+);
 lines.push('');
 lines.push('## Summary');
 lines.push('');
@@ -146,7 +168,10 @@ for (const p of pkgs) {
 }
 
 writeFileSync('THIRD-PARTY-LICENSES.md', lines.join('\n'));
-console.log(`THIRD-PARTY-LICENSES.md: ${pkgs.length} packages, ${apache.length} Apache-2.0, ${withNotice.length} with NOTICE`);
+console.log(
+  `THIRD-PARTY-LICENSES.md: ${pkgs.length} packages, ${apache.length} Apache-2.0, ` +
+  `${withNotice.length} with NOTICE, ${platformGated.length} platform-gated omitted`,
+);
 if (flagged.length) {
   console.error(`COPYLEFT/UNKNOWN: ${flagged.map((p) => `${p.name}(${p.license})`).join(', ')}`);
   process.exit(1);
