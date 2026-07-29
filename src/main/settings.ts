@@ -15,7 +15,14 @@ import { getDb, get, run } from './db/index.js';
 // Secret storage and the Gmail connection state are owned by the gmail module;
 // importing them rather than mirroring them is what keeps the two from
 // disagreeing about whether the mailbox is connected.
-import { getSecret, setSecret, isConnected, getAddress, needsReauth } from './gmail/oauth.js';
+import {
+  getSecret,
+  setSecret,
+  isConnected,
+  getAddress,
+  needsReauth,
+  getClientCredentials,
+} from './gmail/oauth.js';
 import type { Settings, SettingsPatch } from '../shared/ipc.js';
 import type { IcpConfig } from '../shared/score.js';
 
@@ -238,10 +245,11 @@ export async function hasSecret(key: string): Promise<boolean> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getSettings(): Promise<Settings> {
-  const [verifierKeySet, anthropicKeySet, gmailConnected] = await Promise.all([
+  const [verifierKeySet, anthropicKeySet, gmailConnected, gmailClient] = await Promise.all([
     hasSecret(SECRET_VERIFIER),
     hasSecret(SECRET_ANTHROPIC),
     gmailConnectedSafe(),
+    getClientCredentials().catch(() => null),
   ]);
 
   return {
@@ -254,6 +262,12 @@ export async function getSettings(): Promise<Settings> {
       // disconnect it would advertise an account we can no longer send from.
       address: gmailConnected ? getAddress() : null,
       needsReauth: gmailConnected && needsReauth(),
+      clientConfigured: gmailClient !== null,
+      // Env wins over the stored client in getClientCredentials, so when it is
+      // set the UI must not present editable fields that would have no effect.
+      clientFromEnv: Boolean(
+        process.env.RECRUITAI_GMAIL_CLIENT_ID && process.env.RECRUITAI_GMAIL_CLIENT_SECRET,
+      ),
     },
     keys: {
       verifierProvider: getVerifierProvider(),

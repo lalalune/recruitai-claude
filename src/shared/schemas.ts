@@ -390,6 +390,24 @@ export const secretKeySchema = z
 /** Empty is legal — that is how the operator clears a saved key. */
 export const secretValueSchema = z.string().max(8192, 'Secret value is too long');
 
+/**
+ * Google OAuth client credentials.
+ *
+ * Empty is legal on both — that is how the operator clears the stored client.
+ * The client id is shape-checked because pasting the wrong field from the Cloud
+ * Console (the project number, or the whole JSON blob) is the likely mistake,
+ * and catching it here gives a real message instead of an opaque Google error
+ * page after the browser has already opened.
+ */
+export const gmailClientIdSchema = z
+  .string()
+  .max(256, 'Client ID is too long')
+  .refine((v) => v === '' || v.endsWith('.apps.googleusercontent.com'), {
+    message: 'A Google OAuth client ID ends in ".apps.googleusercontent.com"',
+  });
+
+export const gmailClientSecretSchema = z.string().max(256, 'Client secret is too long');
+
 export const suppressionValueSchema = z
   .string()
   .min(1, 'Suppression value cannot be empty')
@@ -455,6 +473,7 @@ export const Schemas = {
   connectGmail: z.tuple([]),
   disconnectGmail: z.tuple([]),
   testGmail: z.tuple([]),
+  setGmailClient: z.tuple([gmailClientIdSchema, gmailClientSecretSchema]),
 
   // linkedin
   getLinkedInStatus: z.tuple([]),

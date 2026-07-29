@@ -261,7 +261,7 @@ export const CLIENT_SETUP_MESSAGE =
   'No Google OAuth client configured. In Google Cloud Console create an OAuth 2.0 ' +
   'Client ID of type "Desktop app", publish the consent screen to "In production" ' +
   '(it does not need verification for personal use), then paste the client ID and ' +
-  'secret into Settings → Gmail.';
+  'secret into the "Google OAuth client" fields in Settings → Gmail.';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Connection state

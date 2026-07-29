@@ -148,20 +148,38 @@ export function AppShell({ screen, onNavigate, stats, children }: AppShellProps)
         )}
       </footer>
 
-      <Toaster
-        position="bottom-right"
-        theme={theme}
-        closeButton
-        toastOptions={{
-          classNames: {
-            toast:
-              'border border-border bg-popover text-popover-foreground text-[12px] rounded-lg shadow-xl',
-            description: 'text-muted-foreground',
-            actionButton: 'bg-primary text-primary-foreground',
-          },
-        }}
-      />
     </div>
+  );
+}
+
+/**
+ * Mounted by App for EVERY screen, deliberately NOT inside AppShell.
+ *
+ * Setup renders outside the shell (it is a full-bleed wizard, not a screen in
+ * the chrome), so while the Toaster lived in AppShell the entire first-run
+ * experience was a toast dead zone: `Connect Gmail` called the real IPC, got a
+ * real "no OAuth client configured" refusal back, and rendered it to nowhere.
+ * The button looked inert, and so did every other failure in the wizard. Any
+ * component that reports through toast() must be able to assume a Toaster
+ * exists — which means mounting it above the shell/wizard branch, not inside
+ * one arm of it.
+ */
+export function AppToaster() {
+  const theme = useUi((s) => s.theme);
+  return (
+    <Toaster
+      position="bottom-right"
+      theme={theme}
+      closeButton
+      toastOptions={{
+        classNames: {
+          toast:
+            'border border-border bg-popover text-popover-foreground text-[12px] rounded-lg shadow-xl',
+          description: 'text-muted-foreground',
+          actionButton: 'bg-primary text-primary-foreground',
+        },
+      }}
+    />
   );
 }
 

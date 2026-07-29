@@ -586,6 +586,37 @@ export function registerSettingsIpc(): void {
     which === 'anthropic' ? testAnthropicKey() : testVerifierKey(getDb()),
   );
 
+  /**
+   * The Google OAuth client, on its own channel.
+   *
+   * setSecret refuses these two keys by design — a renderer able to name
+   * `gmail.client_secret` could repoint the consent flow at someone else's
+   * OAuth client. That protection is worth keeping, but it left the operator
+   * with NO way to supply a client at all outside environment variables, which
+   * a .app launched from Finder never inherits: Connect Gmail could therefore
+   * only ever fail. This channel is the deliberate, audited, shape-checked way
+   * in, and it writes both halves together so a half-configured client cannot
+   * exist.
+   */
+  handle('setGmailClient', async (clientId: string, clientSecret: string) => {
+    const id = clientId.trim();
+    const secret = clientSecret.trim();
+    // Both or neither: a client id with no secret fails at Google with an
+    // error the operator cannot act on, and looks configured until then.
+    if (Boolean(id) !== Boolean(secret)) {
+      throw new Error('A Google OAuth client needs both the client ID and the client secret.');
+    }
+    await writeSecret(gmail.KEY_CLIENT_ID, id);
+    await writeSecret(gmail.KEY_CLIENT_SECRET, secret);
+    if (secret) await warnIfPlaintext();
+    auditLog(getDb(), {
+      actor: 'operator',
+      action: id ? 'setGmailClient' : 'clearGmailClient',
+      entity: 'setting',
+      entityId: gmail.KEY_CLIENT_ID,
+    });
+  });
+
   handle('connectGmail', async () => {
     const result = await gmail.connectGmail();
     if (result.ok) await warnIfPlaintext();

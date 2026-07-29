@@ -244,3 +244,49 @@ describe('coverage map', () => {
     );
   });
 });
+
+/**
+ * The Toaster must be mounted for EVERY screen, not just the ones inside the
+ * app chrome.
+ *
+ * Setup renders outside AppShell (full-bleed wizard, not a screen in the
+ * shell), so while <Toaster/> lived in AppShell the entire first-run experience
+ * was a toast dead zone. The visible symptom was "Connect Gmail does nothing":
+ * it called the real IPC, got a real refusal back, and rendered the error to
+ * nowhere. Every failure in the wizard was equally silent.
+ *
+ * This is a structural property of where the component is mounted, and there is
+ * no DOM in this runner, so it is asserted against the source. If the shell ever
+ * reabsorbs the Toaster, the wizard goes silent again and this fails.
+ */
+describe('toast surface', () => {
+  test('the Toaster is mounted above the shell/wizard branch, not inside AppShell', () => {
+    const shell = fs.readFileSync(path.join(ROOT, 'src/renderer/components/AppShell.tsx'), 'utf8');
+    const app = fs.readFileSync(path.join(ROOT, 'src/renderer/App.tsx'), 'utf8');
+
+    // AppShell may still define AppToaster; what it must not do is RENDER a
+    // Toaster inside its own tree, which is what scoped it to non-setup screens.
+    const shellBody = shell.slice(shell.indexOf('export function AppShell'));
+    const appToasterAt = shellBody.indexOf('export function AppToaster');
+    const shellOnly = appToasterAt === -1 ? shellBody : shellBody.slice(0, appToasterAt);
+    assert.ok(
+      !/<Toaster\b/.test(shellOnly),
+      'AppShell renders a Toaster again — Setup renders outside AppShell, so every toast in the ' +
+        'first-run wizard would be invisible. Mount it in App.tsx instead.',
+    );
+
+    assert.ok(
+      /<AppToaster\s*\/>/.test(app),
+      'App.tsx no longer mounts <AppToaster/>; toasts would render nowhere at all.',
+    );
+
+    // It has to sit OUTSIDE the `screen === 'setup' ? ... : <AppShell>` ternary,
+    // otherwise it is back to covering only one arm.
+    const shellClose = app.lastIndexOf('</AppShell>');
+    const toasterAt = app.indexOf('<AppToaster />');
+    assert.ok(shellClose !== -1 && toasterAt > shellClose,
+      'AppToaster is mounted inside the AppShell arm of the setup/shell branch, so the Setup ' +
+        'wizard is a toast dead zone again.',
+    );
+  });
+});

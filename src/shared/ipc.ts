@@ -367,6 +367,14 @@ export interface Settings {
     connected: boolean;
     address: string | null;
     needsReauth: boolean;
+    /**
+     * Whether a Google OAuth "Desktop app" client is configured at all. Without
+     * one, Connect Gmail cannot even open a consent screen — so the UI needs to
+     * ask for credentials rather than offer a button that can only fail.
+     */
+    clientConfigured: boolean;
+    /** True when the client came from the environment, which the UI cannot edit. */
+    clientFromEnv: boolean;
   };
   keys: {
     verifierProvider: 'reoon' | 'bouncer' | 'millionverifier' | 'none';
@@ -475,6 +483,16 @@ export interface RecruitApi {
   connectGmail(): Promise<{ ok: boolean; address?: string; message: string }>;
   disconnectGmail(): Promise<void>;
   testGmail(): Promise<{ ok: boolean; message: string }>;
+  /**
+   * Store the Google OAuth "Desktop app" client. Deliberately its own channel
+   * rather than two more keys on setSecret: that handler refuses anything
+   * outside its two-key allowlist precisely so the renderer cannot name
+   * `gmail.client_secret` and point the consent flow somewhere else. This
+   * channel is the one audited, explicitly-shaped way in.
+   *
+   * Passing empty strings clears the stored client.
+   */
+  setGmailClient(clientId: string, clientSecret: string): Promise<void>;
 
   // suppression
   listSuppressions(): Promise<SuppressionRow[]>;

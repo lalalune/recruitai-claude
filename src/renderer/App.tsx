@@ -12,7 +12,7 @@ import {
 import { useHotkeys } from 'react-hotkeys-hook';
 import { toast } from 'sonner';
 
-import { AppShell } from './components/AppShell.js';
+import { AppShell, AppToaster } from './components/AppShell.js';
 import { CommandPalette, ShortcutsOverlay } from './components/CommandPalette.js';
 import { EmptyState } from './components/EmptyState.js';
 import { Button } from './components/ui/button.js';
@@ -185,6 +185,10 @@ export default function App() {
           {body}
         </AppShell>
       )}
+
+      {/* Above the shell/wizard branch: Setup renders outside AppShell, and a
+          toast nobody can see is the same as no error handling at all. */}
+      <AppToaster />
 
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={commands} />
       <ShortcutsOverlay open={shortcutsOpen} onOpenChange={setShortcutsOpen} />

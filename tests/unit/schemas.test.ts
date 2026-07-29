@@ -36,6 +36,7 @@ const EXPECTED_CHANNELS = [
   'listDrafts', 'generateDraft', 'patchDraft', 'queueDraft', 'unqueueDraft', 'skipDraft', 'sendNow', 'sendTestEmail',
   'getSendStats', 'startSending', 'pauseSending', 'listInbound', 'markInbound', 'syncInbox', 'listSent', 'getPerformance', 'generateFollowUp',
   'getSettings', 'patchSettings', 'setSecret', 'testKey', 'connectGmail', 'disconnectGmail', 'testGmail',
+  'setGmailClient',
   'getLinkedInStatus', 'connectLinkedIn', 'disconnectLinkedIn',
   'listSuppressions', 'addSuppression', 'removeSuppression', 'importSuppressionsCsv',
   'getStats', 'exportCsv', 'backupNow', 'openDataDir', 'openExternal', 'getScreenshot',
@@ -476,4 +477,30 @@ test('normaliseUrl is deterministic about what it will and will not repair', () 
   assert.equal(normaliseUrl('ftp://acme.com'), null);
   assert.equal(normaliseUrl('localhost'), null);
   assert.equal(normaliseUrl('   '), null);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The Gmail OAuth client channel.
+//
+// This exists because Connect Gmail was inert on a fresh install: setSecret
+// refuses gmail.client_id / gmail.client_secret by design, so there was NO way
+// to supply a client outside environment variables — which a .app launched from
+// Finder never inherits. The channel is the audited way in, so its validation
+// is the thing standing between the operator and an opaque Google error page.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('setGmailClient accepts a real desktop client and rejects the likely mispastes', () => {
+  ok('setGmailClient', ['123-abc.apps.googleusercontent.com', 'GOCSPX-secret']);
+  // Clearing the client is legal, and is how the operator removes it.
+  ok('setGmailClient', ['', '']);
+
+  // The Cloud Console shows several fields near each other; these are the ones
+  // that get pasted by mistake, and each fails at Google with nothing useful.
+  bad('setGmailClient', ['123456789012', 'GOCSPX-secret'], 'apps.googleusercontent.com');
+  bad('setGmailClient', ['{"web":{"client_id":"x"}}', 'GOCSPX-secret'], 'apps.googleusercontent.com');
+  bad('setGmailClient', ['x'.repeat(300), 'GOCSPX-secret'], 'too long');
+
+  // Arity and type still hold at the boundary like every other channel.
+  bad('setGmailClient', ['123-abc.apps.googleusercontent.com'], 'arg1');
+  bad('setGmailClient', [null, 'GOCSPX-secret'], 'arg0');
 });

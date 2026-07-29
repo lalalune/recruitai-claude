@@ -269,6 +269,8 @@ export function GmailPanel({ onConnected }: { onConnected?: (address: string | n
   const qc = useQueryClient();
   const { data: settings } = useSettings();
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
+  const [clientId, setClientId] = useState('');
+  const [clientSecret, setClientSecret] = useState('');
 
   const connect = useMutation({
     mutationFn: () => api.connectGmail(),
@@ -300,11 +302,80 @@ export function GmailPanel({ onConnected }: { onConnected?: (address: string | n
     onError: (e: Error) => toast.error('Test send failed', { description: e.message }),
   });
 
+  const saveClient = useMutation({
+    mutationFn: ({ id, secret }: { id: string; secret: string }) => api.setGmailClient(id, secret),
+    onSuccess: (_r, vars) => {
+      qc.invalidateQueries({ queryKey: SETTINGS_KEY });
+      setClientId('');
+      setClientSecret('');
+      toast.success(vars.id ? 'OAuth client saved' : 'OAuth client cleared');
+    },
+    onError: (e: Error) => toast.error('Could not save OAuth client', { description: e.message }),
+  });
+
   const gmail = settings?.gmail;
   const connected = Boolean(gmail?.connected);
+  // Connect can only ever fail without a client, so it is gated rather than
+  // offered-and-refused: an enabled button that always errors is the shape this
+  // panel already shipped once.
+  const clientReady = Boolean(gmail?.clientConfigured);
 
   return (
     <>
+      <Row
+        label="Google OAuth client"
+        help={
+          gmail?.clientFromEnv
+            ? 'Supplied by RECRUITAI_GMAIL_CLIENT_ID / _SECRET in the environment, which takes precedence over anything saved here.'
+            : clientReady
+              ? 'A client is stored in your OS keychain. Sending and consent both go through your own Google Cloud project.'
+              : 'Google Cloud Console → Credentials → Create OAuth client ID → type "Desktop app". Publish the consent screen to "In production"; personal use needs no verification. Nothing can connect until this is set.'
+        }
+      >
+        {gmail?.clientFromEnv ? (
+          <StatusChip label="from environment" tone="good" />
+        ) : clientReady ? (
+          <>
+            <StatusChip label="configured" tone="good" />
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={saveClient.isPending}
+              onClick={() => saveClient.mutate({ id: '', secret: '' })}
+            >
+              Clear
+            </Button>
+          </>
+        ) : (
+          <div className="flex flex-col items-end gap-1.5">
+            <Input
+              value={clientId}
+              placeholder="xxxx.apps.googleusercontent.com"
+              className="h-8 w-72 text-sm"
+              onChange={(e) => setClientId(e.target.value)}
+            />
+            <div className="flex items-center gap-2">
+              <Input
+                type="password"
+                value={clientSecret}
+                placeholder="client secret"
+                className="h-8 w-56 text-sm"
+                onChange={(e) => setClientSecret(e.target.value)}
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!clientId.trim() || !clientSecret.trim() || saveClient.isPending}
+                onClick={() =>
+                  saveClient.mutate({ id: clientId.trim(), secret: clientSecret.trim() })
+                }
+              >
+                Save
+              </Button>
+            </div>
+          </div>
+        )}
+      </Row>
       <Row
         label="Account"
         help={
@@ -340,7 +411,12 @@ export function GmailPanel({ onConnected }: { onConnected?: (address: string | n
             </Button>
           </>
         ) : (
-          <Button size="sm" onClick={() => connect.mutate()} disabled={connect.isPending}>
+          <Button
+            size="sm"
+            onClick={() => connect.mutate()}
+            disabled={connect.isPending || !clientReady}
+            title={clientReady ? undefined : 'Add a Google OAuth client above first'}
+          >
             <Mail className="mr-1.5 h-3.5 w-3.5" />
             {connect.isPending ? 'Waiting for browser…' : 'Connect Gmail'}
           </Button>

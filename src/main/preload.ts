@@ -11,7 +11,7 @@ const METHODS = [
   'listDrafts','generateDraft','patchDraft','queueDraft','unqueueDraft','skipDraft','sendNow','sendTestEmail',
   'getSendStats','startSending','pauseSending','listInbound','markInbound','syncInbox','listSent','getPerformance','generateFollowUp',
   'getLinkedInStatus','connectLinkedIn','disconnectLinkedIn',
-  'getSettings','patchSettings','setSecret','testKey','connectGmail','disconnectGmail','testGmail',
+  'getSettings','patchSettings','setSecret','testKey','connectGmail','disconnectGmail','testGmail','setGmailClient',
   'listSuppressions','addSuppression','removeSuppression','importSuppressionsCsv',
   'getStats','exportCsv','backupNow','openDataDir','openExternal','getScreenshot',
 ] as const;
