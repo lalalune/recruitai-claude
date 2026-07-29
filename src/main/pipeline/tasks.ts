@@ -5,7 +5,7 @@
  * and neither may import anything above it in the dependency graph.
  *
  * The claim is a single `UPDATE ... WHERE id = (SELECT ...) RETURNING *`. SQLite
- * executes that atomically, so the main process and the utilityProcess worker
+ * executes that atomically, so the main process and the pipeline
  * can both poll the same table without a lock, a lease column, or a race.
  */
 

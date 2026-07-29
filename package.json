@@ -12,9 +12,9 @@
   "scripts": {
     "dev": "concurrently -k -n vite,main,electron -c cyan,yellow,green \"bun run dev:renderer\" \"bun run dev:main\" \"bun run dev:electron\"",
     "dev:renderer": "vite",
-    "dev:main": "bun run build:main -- --watch",
+    "dev:main": "concurrently -k -n idx,pre -c gray,gray \"bun run build:main:index -- --watch\" \"bun run build:main:preload -- --watch\"",
     "dev:electron": "wait-on tcp:5183 dist/main/index.cjs && electron . --dev",
-    "build:main": "esbuild src/main/index.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --outfile=dist/main/index.cjs && esbuild src/main/preload.ts --bundle --platform=node --format=cjs --target=node24 --external:electron --outfile=dist/main/preload.cjs",
+    "build:main": "bun run build:main:index && bun run build:main:preload",
     "build:renderer": "vite build",
     "build": "bun run build:main && bun run build:renderer",
     "dist": "bun run build && electron-builder --publish never",
@@ -25,7 +25,9 @@
     "test": "node scripts/run-tests.mjs",
     "seed": "esbuild scripts/seed.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --log-level=error --outfile=dist/seed.cjs && node dist/seed.cjs",
     "smoke": "esbuild scripts/smoke.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --log-level=error --outfile=dist/smoke.cjs && node dist/smoke.cjs",
-    "test:watch": "node --watch scripts/run-tests.mjs"
+    "test:watch": "node --watch scripts/run-tests.mjs",
+    "build:main:index": "esbuild src/main/index.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --outfile=dist/main/index.cjs",
+    "build:main:preload": "esbuild src/main/preload.ts --bundle --platform=node --format=cjs --target=node24 --external:electron --outfile=dist/main/preload.cjs"
   },
   "dependencies": {
     "@googleapis/gmail": "17.0.0",
@@ -63,5 +65,14 @@
     "typescript": "5.9.3",
     "vite": "8.1.5",
     "wait-on": "9.1.0"
+  },
+  "author": "Shaw Walters",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lalalune/recruitai-claude.git"
+  },
+  "homepage": "https://github.com/lalalune/recruitai-claude#readme",
+  "bugs": {
+    "url": "https://github.com/lalalune/recruitai-claude/issues"
   }
 }

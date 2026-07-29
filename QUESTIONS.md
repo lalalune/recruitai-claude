@@ -5,6 +5,9 @@ The first four are blocking — I can't finalize the implementation plan without
 
 ---
 
+> **Answer these in a local copy, not here.** `cp QUESTIONS.md QUESTIONS.local.md` — `*.local.md` is gitignored. Several answers (client list, capacity, fee floor, warm intro paths) are exactly the information that must not end up in a public repo.
+
+
 ## BLOCKING
 
 ### Q1. Delivery capacity → how big should the list actually be?
@@ -83,7 +86,7 @@ Bullhorn / Loxo / Recruiterflow / Crelate / Attio / Airtable / Postgres+Metabase
 *The most common way this project dies is landing in a database recruiters never open.*
 
 ### Q9. LinkedIn — accept the recommendation, or proceed?
-Recommendation: don't scrape with any account you care about; buy the graph for $250–1,500. If proceeding anyway: burner accounts only, or risk the agency account?
+Recommendation: don't scrape with an account you care about; buy the graph for $250–1,500. If you enable the module anyway, sign in with an account you can afford to lose — it is identification-only and stops rather than routes around a block, but the account is still exposed.
 
 > **A:**
 

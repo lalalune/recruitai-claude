@@ -91,7 +91,7 @@ CREATE TABLE req (
   days_open         INTEGER,
   repost_count      INTEGER NOT NULL DEFAULT 0,
 
-  -- LLM-classified from description. Never produces contact values.
+  -- Deterministically classified from description. Never produces contact values.
   function_family   TEXT,
   seniority         TEXT,
   no_agency_disclaimer INTEGER,

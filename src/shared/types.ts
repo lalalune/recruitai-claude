@@ -111,7 +111,7 @@ export interface Requisition {
   daysOpen: number | null;
   repostCount: number;
 
-  /** LLM-classified from descriptionText. Never generates contact values. */
+  /** Deterministically classified from descriptionText; never a model-generated value. */
   functionFamily: string | null;
   seniority: string | null;
   noAgencyDisclaimer: boolean | null;

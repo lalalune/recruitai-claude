@@ -7,7 +7,7 @@
  * gmail/oauth.ts, and only the *presence* of a secret is exposed here.
  *
  * Deliberately free of any static `electron` import so the pipeline modules that
- * depend on it can also be loaded inside the utilityProcess worker.
+ * depend on it can also be loaded inside the pipeline.
  */
 
 import path from 'node:path';

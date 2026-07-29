@@ -34,7 +34,7 @@ export interface HttpResponse {
 }
 
 export const USER_AGENT =
-  'recruitAI/0.1 (+https://github.com/shawwalters/recruitAI; local research tool)';
+  'recruitAI/0.1 (+https://github.com/lalalune/recruitai-claude; local research tool)';
 
 const DEFAULT_TIMEOUT = 20_000;
 const DEFAULT_MAX_BYTES = 40 * 1024 * 1024;

@@ -7,6 +7,11 @@ blobs/
 exports/
 backups/
 
+# Answered scoping questions contain the client list, capacity and fee floor.
+# Fill in a local copy; the tracked QUESTIONS.md stays a blank template.
+QUESTIONS.local.md
+*.local.md
+
 # secrets
 .env
 .env.*

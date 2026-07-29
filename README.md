@@ -40,7 +40,7 @@ Full interaction design in [UX.md](UX.md).
 Requires **Node 24+** and **Bun**.
 
 ```bash
-git clone https://github.com/shawwalters/recruitAI.git && cd recruitAI && bun install && bun run dev
+git clone https://github.com/lalalune/recruitai-claude.git && cd recruitai-claude && bun install && bun run dev
 ```
 
 That starts Vite, the esbuild watcher and Electron together. First launch walks you through a four-step setup and drops you into Review with real records — **no API keys required**, because the entire discovery layer is free.
@@ -82,13 +82,13 @@ src/
 
 **`node:sqlite`, no ORM, zero native dependencies.** Node 24 ships SQLite 3.51 with WAL, FTS5, STRICT tables and JSONB compiled in. That single choice removes native addon rebuilds, ABI matching and per-platform prebuilds from the project entirely — which is what makes cross-platform packaging painless. (Bun has no `node:sqlite`, so Bun is the package manager and task runner only; the backend always runs under Node.)
 
-Long-running work happens in an Electron `utilityProcess`, because `node:sqlite` is synchronous and would otherwise block the UI.
+Long-running work runs in the main process. `node:sqlite` is synchronous, but the sweeps are network-bound rather than CPU-bound, so awaiting HTTP yields to the event loop and the UI stays responsive; the SQLite writes themselves are sub-millisecond at this scale.
 
 ## Design rules
 
 A few constraints are enforced in code rather than left to discipline:
 
-**An LLM may select, never generate.** Models are used to normalise titles, classify job descriptions and phrase email prose. They are never asked to produce an email address or phone number. Where a model chooses between candidates, its output schema is an integer index into a retrieved list — it is structurally unable to emit an address that wasn't already observed from a source. Every contact value in the database has a foreign key to the evidence it came from.
+**An LLM never produces a contact value.** Title normalisation, persona classification and job-description analysis are all deterministic rule tables, not model calls — cheaper, auditable, and good enough. There is exactly one model call in the codebase: rewriting the prose of an outreach draft. It is handed a facts object that structurally cannot contain an address, the `draft` table has no recipient column, and any output containing an `@`, a URL or a phone-shaped run is rejected before it is stored. The recipient is always read from the contact row, which in turn carries a foreign key to the evidence it was observed from.
 
 **Blocks are respected.** On a 429 or 403 the relevant source backs off and stops, and tells you. There is no proxy rotation and no CAPTCHA solving. Reading public data briskly is one thing; circumventing a deliberate block is another, and it would turn an operational annoyance into a legal argument.
 

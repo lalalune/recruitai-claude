@@ -14,7 +14,7 @@
 **Key consequences:**
 1. The entire hiring-signal layer costs **$0**. This is the highest-ROI part of the system and needs no vendor.
 2. `updated_at` / `first_published` / `publishedAt` give **job posting age** → the "stuck req open >45 days" signal, which is the single best pitch hook for a recruiting agency.
-3. **404-vs-200 is a free company-discovery primitive**: brute-force/dictionary board tokens against each ATS to enumerate which companies use it, without paying BuiltWith/PredictLeads.
+3. **404-vs-200 tells you cheaply whether a company you already know about uses a given ATS.** Note what the implementation deliberately does *not* do with that: it never generates token permutations to enumerate an ATS vendor's customer list. Every token probed is derived from a company already discovered from YC, Form D or HN — so we only ever ask an ATS about companies we have independent reason to believe exist. That is both more effective (a real name resolves faster than a dictionary) and more defensible.
 4. Ashby returning full job descriptions inline means LLM parsing of requirements/seniority costs one API call, not two.
 
 ### Per-host rate-limit behaviour (measured 2026-07-28, during a live 1,444-company sweep)

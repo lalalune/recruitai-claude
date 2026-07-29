@@ -13,7 +13,7 @@ Five findings change the shape of what you asked for. Each is defended in detail
 
 **2. Buy the contacts. Don't build the enrichment waterfall.** The research's own arithmetic argues against itself: DIY waterfall $2,400–5,600 vs. Clay $5,400–9,000, a ~$3,400 spread consumed several times over by the 2–4 weeks of your time to build and then maintain 5–8 provider adapters against APIs that reprice quarterly. Build the signal layer (nobody sells it); buy the addresses (everybody sells them).
 
-**3. Don't scrape LinkedIn with your account — and this is the one place I'm pushing back on your brief.** You asked for cookie injection. The architecture works, and I can build it, but the economics are inverted: Coresignal or Bright Data sell the same person+company graph for $250–$1,500 at your volume, which is *less* than the tooling you'd buy to scrape it yourself. Meanwhile LinkedIn shut down Proxycurl in July 2025 (permanent injunction, data deletion) and hit HeyReach with a cease-and-desist in March 2026 — deleting its company page and banning the founder's personal profile. For a recruiting agency, your LinkedIn network, Recruiter seat and InMail history *are* the business. Risking them to save ~$1,500 is a catastrophic trade. Note the legal asymmetry: *Meta v. Bright Data* (2024) held logged-**out** scraping isn't bound by ToS, but the moment you inject `li_at` you're logged in, contractually bound, and in hiQ's losing posture — hiQ consented to a $500k judgment. If you want it anyway, §7 specifies the burner-account architecture.
+**3. Don't scrape LinkedIn with your account — and this is the one place I'm pushing back on your brief.** You asked for cookie injection. The architecture works, and I can build it, but the economics are inverted: Coresignal or Bright Data sell the same person+company graph for $250–$1,500 at your volume, which is *less* than the tooling you'd buy to scrape it yourself. Meanwhile LinkedIn shut down Proxycurl in July 2025 (permanent injunction, data deletion) and hit HeyReach with a cease-and-desist in March 2026 — deleting its company page and banning the founder's personal profile. For a recruiting agency, your LinkedIn network, Recruiter seat and InMail history *are* the business. Risking them to save ~$1,500 is a catastrophic trade. Note the legal asymmetry: *Meta v. Bright Data* (2024) held logged-**out** scraping isn't bound by ToS, but the moment you inject `li_at` you're logged in, contractually bound, and in hiQ's losing posture — hiQ consented to a $500k judgment. If you enable it anyway, §7 covers the constraints the shipped module enforces.
 
 **4. There is a California statute that breaks the standard cold-email playbook.** Cal. Bus. & Prof. Code §17529.5: **$1,000 per email, private right of action, class actions available.** *Balsam v. Trancos* makes WHOIS-private throwaway sending domains a *per se* violation. Every "buy 10 lookalike domains with privacy protection" guide is describing a $1,000-per-message liability in your home state. Fix is cheap — public WHOIS resolving to the agency, agency named in the body — but it must be decided before you buy domains.
 
@@ -256,17 +256,16 @@ Phones deserve their own warning. The best independent benchmark (1,400 US B2B c
 
 ## 7. If you still want LinkedIn
 
-Your call, and the architecture is sound if you accept the risk. Non-negotiables:
+The recommendation stands: don't scrape it. Buy the graph from a data vendor — at your volume that costs less than the tooling you'd need, and it doesn't put the account your business runs on at risk.
 
-1. **Burner accounts only. Never the agency identity, never your personal profile.**
-2. **LinkedIn for identification only** — name, title, company, profile URL. Emails come from a separate provider. This single split is the highest-leverage mitigation, because it means a lost account costs you a scraping session, not your contact database.
-3. Residential proxy in the account's usual geography; one persistent profile per account per proxy.
-4. Per-account daily budgets well under the commercial-search limit, human pacing, session persistence.
-5. Cookies in Keychain or 1Password, never in the repo. Detect expiry and prompt for refresh rather than retrying into a lockout.
-6. **Never solve a CAPTCHA** — treat it as a stop signal and route to the paid API fallback.
+If you enable the module anyway, the shipped implementation makes two choices that matter, and neither is negotiable:
 
-Note the residual exposure even if you buy instead of scrape: LinkedIn ToS 8.2.4 purports to bind you as a *buyer* of scraped data ("whether directly or through third parties (such as … data aggregators or brokers)") for as long as you hold a LinkedIn account.
+1. **LinkedIn is used for identification only** — name, title, company, profile URL. Email addresses always come from elsewhere. This is the highest-leverage mitigation available, because it means losing the session costs you a scraping run rather than your contact database.
+2. **A block is a stop, not an obstacle.** On a 429, a 999, or a checkpoint, the module halts for the day and surfaces it to you. It does not retry, does not route around, and never attempts a CAPTCHA. That is a deliberate constraint in the code, not a default that could drift.
 
+Sign in with an account you can afford to lose. Session state lives in the OS keychain, never in the repo.
+
+Worth knowing regardless of which path you take: LinkedIn ToS 8.2.4 purports to bind you as a *buyer* of scraped data ("whether directly or through third parties (such as … data aggregators or brokers)") for as long as you hold a LinkedIn account. Buying reduces exposure; it does not eliminate it.
 ---
 
 ## 8. Build sequence
