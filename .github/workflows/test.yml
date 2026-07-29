@@ -44,6 +44,9 @@ jobs:
       - if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          # bun skips lifecycle scripts, so Electron's binary downloads lazily
+          # on first launch — force it NOW so the sandbox helper exists to fix.
+          node node_modules/electron/install.js
           # Electron's SUID sandbox helper must be root:4755 on Linux. Fixing
           # ownership keeps the sandbox ENABLED — never --no-sandbox the boot
           # test; a sandboxed boot is part of what it proves.

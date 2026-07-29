@@ -35,7 +35,12 @@ before(() => {
 
 after(() => {
   closeDb();
-  if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  try {
+    if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch {
+    /* Windows holds handles past close() long enough to defeat retries — a
+       leaked CI tmpdir must not fail the suite (same stance as the stub). */
+  }
 });
 
 function reset(): void {
