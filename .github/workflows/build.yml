@@ -8,8 +8,46 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Correctness gates run once on Linux rather than three times across the
+  # matrix — they are platform-independent and the packaging jobs are the slow
+  # part. A failure here stops the release before any binary is built.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The backend runs under Node, not Bun — Bun has no node:sqlite. Bun is
+      # the package manager and task runner only.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      - run: bun run test
+
+      # The generator exits non-zero if any dependency is copyleft or declares
+      # no license, so a bad transitive dep blocks the release rather than
+      # shipping inside an Apache-2.0 binary.
+      - name: Verify third-party licenses are current
+        run: |
+          bun run licenses
+          git diff --exit-code THIRD-PARTY-LICENSES.md \
+            || (echo "::error::THIRD-PARTY-LICENSES.md is stale — run 'bun run licenses' and commit." && exit 1)
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -40,36 +78,97 @@ jobs:
         with:
           bun-version: latest
 
-      # Electron bundles its own Node 24 at runtime, but the build scripts and
-      # typecheck run on the host toolchain.
       - uses: actions/setup-node@v5
         with:
           node-version: 24
 
-      - run: bun install --frozen-lockfile
+      # Electron ships a ~150 MB runtime per platform/arch. Without this every
+      # job redownloads it.
+      - name: Cache Electron binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-${{ matrix.os }}-${{ hashFiles('package.json') }}
+          restore-keys: electron-${{ matrix.os }}-
 
-      - run: bun run typecheck
+      - run: bun install --frozen-lockfile
 
       - run: bun run ${{ matrix.script }}
         env:
-          # Unsigned builds. Signing would need an Apple Developer account and a
-          # Windows code-signing cert; see README for what users see without them.
+          # Unsigned builds. Signing needs an Apple Developer account and a
+          # Windows certificate; the README documents what users see without them.
           CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: List built artifacts
+        shell: bash
+        run: ls -la release/ || dir release
 
       - uses: actions/upload-artifact@v4
         with:
           name: recruitai-${{ matrix.os }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+          retention-days: 14
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v4
-        with: { path: artifacts }
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Show what will be released
+        run: ls -la artifacts/
+
+      # Unsigned binaries need a per-platform first-launch step, so the release
+      # notes say so rather than leaving people with a Gatekeeper dialog and no
+      # explanation.
+      - name: Compose release notes
+        run: |
+          cat > NOTES.md <<'EOF'
+          ## Install
+
+          Downloads are **unsigned** — code signing needs an Apple Developer account and a
+          Windows certificate, which a single-operator tool does not justify. First launch
+          needs one extra step:
+
+          | Platform | File | First launch |
+          |---|---|---|
+          | macOS (Apple silicon) | `*-arm64.dmg` | `xattr -dr com.apple.quarantine /Applications/recruitAI.app` |
+          | macOS (Intel) | `*.dmg` (no arch suffix) | same as above |
+          | Windows | `*.exe` | SmartScreen → *More info* → *Run anyway* |
+          | Linux | `*.AppImage` / `*.deb` | `chmod +x` the AppImage |
+
+          Building from source avoids all of this: `bun install && bun run dist`.
+
+          ## What this is
+
+          A local-first desktop app that finds Bay Area startups actively hiring, ranks them
+          by expected fee and hiring urgency, and paces individually-written outreach from
+          your own Gmail. No server, no account, no telemetry — company data never leaves
+          your machine.
+
+          Discovery needs **no API keys**: Greenhouse, Ashby, Lever, SmartRecruiters,
+          Workable and Workday all publish open roles as unauthenticated JSON.
+
+          Licensed under Apache-2.0. Third-party attributions ship inside the app and in
+          [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
+          EOF
+
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
+          body_path: NOTES.md
           generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -227,6 +227,8 @@ export interface CareersProbe {
   platform: string;
   token: string;
   foundAt: string;
+  /** The page we read the link out of — the evidence for platform and token. */
+  pageBody: string;
 }
 
 export async function resolveAtsFromCareersPage(website: string): Promise<CareersProbe | null> {
@@ -243,11 +245,43 @@ export async function resolveAtsFromCareersPage(website: string): Promise<Career
       const m = res.body.match(re);
       const token = m?.[1];
       if (token && !RESERVED_TOKENS.has(token.toLowerCase())) {
-        return { platform, token, foundAt: url };
+        return { platform, token, foundAt: url, pageBody: res.body };
       }
     }
   }
   return null;
+}
+
+/**
+ * Second-level public suffixes we actually encounter. A full Public Suffix List
+ * is overkill for a Bay-Area startup database; getting `co.uk` and friends right
+ * covers the real cases and a mis-split here only costs us one merge.
+ *
+ * Lives in this module rather than beside `etldPlusOne` because `ingest.ts`
+ * already imports from here and not the other way round.
+ */
+export const MULTI_PART_SUFFIXES = new Set([
+  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'com.au', 'net.au', 'org.au', 'co.nz',
+  'co.jp', 'co.kr', 'com.br', 'com.mx', 'com.ar', 'co.in', 'co.za', 'com.sg',
+  'com.hk', 'com.tw', 'com.tr', 'co.il', 'com.cn', 'co.id', 'com.ua', 'co.th',
+]);
+
+/**
+ * The label that identifies the company inside a URL: the one immediately left
+ * of the public suffix.
+ *
+ * Taking the FIRST label instead is how `http://us.memebox.com` produced the
+ * ATS token "us" — which resolved a stranger's Greenhouse board and attributed
+ * their requisitions to MBX. A subdomain is never the company's identity.
+ */
+export function registrableLabel(website: string): string | null {
+  const m = website.match(/^https?:\/\/([^/?#]+)/i);
+  if (!m?.[1]) return null;
+  const host = (m[1].toLowerCase().split(':')[0] ?? '').replace(/\.+$/, '');
+  const parts = host.split('.').filter(Boolean);
+  if (parts.length < 2) return null;
+  const suffixLen = parts.length >= 3 && MULTI_PART_SUFFIXES.has(parts.slice(-2).join('.')) ? 2 : 1;
+  return parts[parts.length - 1 - suffixLen] ?? null;
 }
 
 /**
@@ -273,8 +307,8 @@ export function candidateTokens(name: string, website: string | null): string[] 
   }
 
   if (website) {
-    const m = website.match(/https?:\/\/(?:www\.)?([^./]+)/i);
-    if (m?.[1]) out.push(m[1].toLowerCase());
+    const label = registrableLabel(website);
+    if (label) out.push(label);
   }
 
   return [...new Set(out.filter((t) => t.length >= 2 && t.length <= 60))];

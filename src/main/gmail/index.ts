@@ -43,6 +43,7 @@ export {
   getSecret,
   setSecret,
   deleteSecret,
+  encryptionAvailable,
   getSetting,
   setSetting,
   // events

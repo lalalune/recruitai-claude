@@ -11,14 +11,14 @@ import type { BrowserWindow } from 'electron';
 import { getDb, all, get, type Db } from '../db/index.js';
 import { BlockedError } from '../util/http.js';
 import { getSetting, setSetting, getCrawl, getSpendCapUsd, hasSecret, SECRET_VERIFIER, SECRET_ANTHROPIC } from '../settings.js';
-import { spendByProvider, requeueStale, SpendCapExceeded } from './tasks.js';
+import { spendByProvider, requeueStale, releaseStaleReservations, SpendCapExceeded } from './tasks.js';
 import { SpendCapError } from '../verify/verifier.js';
 import { ingestYc, ingestAtsSweep, ingestCareersCrawl, ingestHn, ingestSecFormD } from './ingest.js';
 import { scoreAll, recomputeCompany } from './scoring.js';
 import { generateAllDrafts } from './drafts.js';
 import * as linkedin from '../linkedin/index.js';
 import { ingestLinkedInUrls } from './ingest.js';
-import { discoverContacts, verifyCompanyContacts, upsertContact, estimatePendingVerifications } from './contacts.js';
+import { discoverContacts, verifyCompanyContacts, upsertContact } from './contacts.js';
 import { observeCompany } from './ingest.js';
 import type { EventName, LogLine, PipelineState, RecruitEvents, SourceKey, SourceStatus } from '../../shared/ipc.js';
 
@@ -81,6 +81,58 @@ function gate(alias: string): string {
 
 const ENRICHMENT_GATE = gate('');
 const ENRICHMENT_GATE_CO = gate('co');
+
+/**
+ * How many paid verifier credits the NEXT run would spend, for the Pipeline
+ * cost chip and the spend-confirmation dialog. Mirrors runEmailVerify exactly:
+ * only companies passing the enrichment gate AND holding at least one
+ * unverified-address contact are visited, and within them the count follows
+ * verifyCompanyContacts' job builder — every non-fresh address plus 1 candidate
+ * per address-less contact when the domain's pattern is known, else 2. The old
+ * detached estimator counted every contact in the database, so the dialog
+ * quoted spend for runs that were actually free no-ops.
+ */
+export function estimatePendingVerifications(db: Db, freshnessDays: number): number {
+  const cutoff = Date.now() - freshnessDays * 86_400_000;
+  const row = get<{ n: number }>(
+    db,
+    `WITH targeted AS (
+       SELECT co.id, co.domain FROM company co
+        WHERE ${ENRICHMENT_GATE_CO}
+          AND EXISTS (SELECT 1 FROM contact t WHERE t.company_id = co.id
+                       AND t.email IS NOT NULL AND t.email_verdict = 'unverified')
+     )
+     SELECT
+       (SELECT count(*) FROM contact c JOIN targeted t ON t.id = c.company_id
+         WHERE c.email IS NOT NULL
+           AND c.status NOT IN ('contacted','replied')
+           AND (c.email_verdict = 'unverified' OR c.email_verified_at IS NULL OR c.email_verified_at < ?))
+       +
+       (SELECT COALESCE(sum(CASE WHEN EXISTS (SELECT 1 FROM email_pattern p WHERE p.domain = t.domain)
+                                 THEN 1 ELSE 2 END), 0)
+          FROM contact c JOIN targeted t ON t.id = c.company_id
+         WHERE c.email IS NULL AND c.first_name IS NOT NULL AND t.domain IS NOT NULL
+           AND c.status NOT IN ('contacted','replied')) AS n`,
+    cutoff,
+  );
+  return row?.n ?? 0;
+}
+
+// The Pipeline screen polls state a few times a second while visible; the
+// estimate is a compound query, so it is memoised briefly rather than run on
+// every poll tick.
+let verifyEstimateCache: { at: number; n: number } | null = null;
+
+function estimatePendingVerificationsCached(db: Db): number {
+  if (verifyEstimateCache && Date.now() - verifyEstimateCache.at < 5_000) return verifyEstimateCache.n;
+  // Same freshness the run itself uses (verifier.ts loadVerifierConfig) — a
+  // hardcoded 183 disagreed with the operator's verify.freshnessDays setting.
+  const raw = getSetting<number>('verify.freshnessDays', 183);
+  const freshnessDays = Number.isFinite(raw) ? Math.min(3650, Math.max(1, Number(raw))) : 183;
+  const n = estimatePendingVerifications(db, freshnessDays);
+  verifyEstimateCache = { at: Date.now(), n };
+  return n;
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -337,9 +389,7 @@ const SOURCES: Record<SourceKey, SourceDef> = {
     defaultEnabled: true,
     requiresKey: 'verifier',
     estimateCostUsd: (db) => {
-      // The freshness-aware estimator: counts stale re-verifications and
-      // pattern candidates too, matching what a run would actually spend.
-      const n = estimatePendingVerifications(db, 183);
+      const n = estimatePendingVerificationsCached(db);
       return n === 0 ? null : Math.round(n * VERIFY_USD_PER_EMAIL * 100) / 100;
     },
     run: runEmailVerify,
@@ -596,8 +646,13 @@ async function runOne(key: SourceKey, def: SourceDef): Promise<void> {
 
 /** Called once at startup: nothing may be left claimed by a process that died. */
 export function recoverAfterRestart(): void {
-  const requeued = requeueStale(getDb());
+  // Floor 0 — see requeueStale: at startup every 'running' task is an orphan.
+  const requeued = requeueStale(getDb(), 0);
   if (requeued > 0) appendLog('pipeline', 'info', `Requeued ${requeued} tasks left running by a previous session.`);
+  const released = releaseStaleReservations(getDb());
+  if (released > 0) {
+    appendLog('pipeline', 'info', `Released ${released} spend reservation(s) orphaned by a previous session.`);
+  }
 }
 
 function messageOf(err: unknown): string {

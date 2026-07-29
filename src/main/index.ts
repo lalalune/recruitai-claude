@@ -7,11 +7,12 @@
  * synchronous but its writes are sub-millisecond at this scale.
  */
 
-import { app, BrowserWindow, protocol, net, shell } from 'electron';
+import { app, BrowserWindow, protocol, net, session, shell } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { initDb, closeDb, getDb, backup } from './db/index.js';
+import { redactError } from './gmail/redact.js';
 import { resolveWithin } from './util/apppath.js';
 import { registerIpc, wireWindow } from './ipc/index.js';
 import { pauseSending } from './ipc/outreach.js';
@@ -188,8 +189,23 @@ function rotatingBackup(): void {
   }
 }
 
+/**
+ * Electron's default is to GRANT every permission a page asks for, with no
+ * prompt. This app needs none of them — it is a local SPA that talks to the
+ * main process over IPC — so the whole class is refused rather than trusted to
+ * stay unused. (The LinkedIn partition installs its own denial in
+ * linkedin/session.ts; that one is the window where live third-party content
+ * would otherwise be doing the asking.)
+ */
+function denyAllPermissions(): void {
+  const ses = session.defaultSession;
+  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+  ses.setPermissionCheckHandler(() => false);
+}
+
 app.whenReady().then(() => {
   if (!isPrimary) return;
+  denyAllPermissions();
   initDb(path.join(DATA_DIR, 'recruitai.db'));
   if (!isDev) registerAppProtocol();
   createWindow();
@@ -225,5 +241,7 @@ app.on('before-quit', () => {
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('[main] uncaught:', err);
+  // An escaped Google-client rejection carries the request (and its bearer
+  // token) on the error object; printing it raw would put that in the log.
+  console.error('[main] uncaught:', redactError(err));
 });

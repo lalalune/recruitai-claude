@@ -265,6 +265,17 @@ function makeResolver(timeoutMs: number): Resolver {
   return new Resolver({ timeout: timeoutMs, tries: 2 });
 }
 
+export interface MxLookupOptions {
+  force?: boolean;
+  timeoutMs?: number;
+  /**
+   * Resolver seam. Everything above this line is caching policy, and caching
+   * policy is exactly where the bugs are — so it has to be exercisable without
+   * a live network. Production never passes this.
+   */
+  resolve?: (domain: string, opts: { timeoutMs?: number }) => Promise<DomainMxInfo>;
+}
+
 const memoryCache = new Map<string, DomainMxInfo>();
 
 export function clearMxMemoryCache(): void {
@@ -338,10 +349,11 @@ async function hasAddressRecord(resolver: Resolver, domain: string): Promise<boo
 export async function lookupDomainMx(
   db: Db,
   domain: string,
-  opts: { force?: boolean; timeoutMs?: number } = {},
+  opts: MxLookupOptions = {},
 ): Promise<DomainMxInfo> {
+  const resolve = opts.resolve ?? resolveDomainMx;
   const d = domain.toLowerCase().replace(/\.$/, '');
-  if (!d) return resolveDomainMx(d, opts);
+  if (!d) return resolve(d, opts);
 
   if (!opts.force) {
     const mem = memoryCache.get(d);
@@ -374,10 +386,15 @@ export async function lookupDomainMx(
     }
   }
 
-  const info = await resolveDomainMx(d, opts);
+  const info = await resolve(d, opts);
+  // A transient failure says nothing about the domain, so never keep it —
+  // not on disk and not in memory either. Memoising it pinned the domain to
+  // "DNS lookup failed — retry later" for the whole life of the process, so a
+  // single resolver blip during a crawl meant every address at that domain was
+  // silently skipped until the app restarted.
+  if (info.transient) return info;
   memoryCache.set(d, info);
-  // A transient failure says nothing about the domain, so never persist it.
-  if (!info.transient) saveMxProvider(db, d, info.provider);
+  saveMxProvider(db, d, info.provider);
   return info;
 }
 
@@ -428,7 +445,7 @@ export function getCatchAllFlag(db: Db, domain: string): boolean | null {
 export async function prefilter(
   db: Db,
   rawEmail: string,
-  opts: { force?: boolean; timeoutMs?: number } = {},
+  opts: MxLookupOptions = {},
 ): Promise<PrefilterResult> {
   const email = normalizeEmail(rawEmail);
   const domain = domainOf(email);

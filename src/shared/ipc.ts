@@ -306,6 +306,15 @@ export interface SendStats {
   windowStart: string;
   windowEnd: string;
   inWindow: boolean;
+  /** Why the queue last stopped on its own (breaker/quota/auth); null when the
+   *  operator paused it or sending is running. */
+  pausedReason: string | null;
+}
+
+/** What marking an inbound message did — lets the UI report the real
+ *  suppression scope (address vs domain) and offer a targeted Undo. */
+export interface MarkInboundResult {
+  suppressed: { kind: 'email' | 'domain'; value: string; ids: number[] } | null;
 }
 
 export interface InboundRow {
@@ -444,7 +453,7 @@ export interface RecruitApi {
   startSending(): Promise<void>;
   pauseSending(): Promise<void>;
   listInbound(handled?: boolean): Promise<InboundRow[]>;
-  markInbound(id: string, action: 'positive' | 'negative' | 'bounce' | 'ignore'): Promise<void>;
+  markInbound(id: string, action: 'positive' | 'negative' | 'bounce' | 'ignore'): Promise<MarkInboundResult>;
   syncInbox(): Promise<number>;
   /** Sent messages with their outcome, newest first — the follow-up work surface. */
   listSent(): Promise<SentRow[]>;

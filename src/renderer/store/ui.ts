@@ -101,6 +101,8 @@ interface UiState {
   cycleSort: () => void;
   toggles: ReviewToggles;
   toggle: (k: keyof ReviewToggles) => void;
+  /** Everything the left rail narrows the list with, back to "show me all of it". */
+  resetView: () => void;
 
   /**
    * The focused row is state, not DOM focus: virtualized rows unmount as they
@@ -174,6 +176,13 @@ export const useUi = create<UiState>((set, get) => ({
   toggles: initialPrefs.toggles,
   toggle: (k) => {
     set({ toggles: { ...get().toggles, [k]: !get().toggles[k] } });
+    persist(get());
+  },
+  // The toggle chips narrow the list exactly as hard as the filter and the
+  // search do, so a "reset" that left them set would leave the operator staring
+  // at the same empty list they just tried to escape.
+  resetView: () => {
+    set({ filter: 'all', search: '', toggles: { ...defaultPrefs.toggles } });
     persist(get());
   },
 

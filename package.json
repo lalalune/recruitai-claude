@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Local-first lead engine: find SF Bay Area startups that are hiring, plus the people who decide to hire an agency.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "main": "dist/main/index.cjs",
   "engines": {
     "node": ">=24"
@@ -29,7 +29,8 @@
     "smoke": "esbuild scripts/smoke.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --log-level=error --outfile=dist/smoke.cjs && node dist/smoke.cjs",
     "test:watch": "node --watch-path=tests --watch-path=src scripts/run-tests.mjs",
     "build:main:index": "esbuild src/main/index.ts --bundle --platform=node --format=cjs --target=node24 --loader:.sql=text --external:electron --outfile=dist/main/index.cjs",
-    "build:main:preload": "esbuild src/main/preload.ts --bundle --platform=node --format=cjs --target=node24 --external:electron --outfile=dist/main/preload.cjs"
+    "build:main:preload": "esbuild src/main/preload.ts --bundle --platform=node --format=cjs --target=node24 --external:electron --outfile=dist/main/preload.cjs",
+    "licenses": "node scripts/gen-third-party.mjs"
   },
   "dependencies": {
     "@googleapis/gmail": "17.0.0",

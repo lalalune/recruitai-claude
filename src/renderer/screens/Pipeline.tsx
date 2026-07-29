@@ -6,6 +6,7 @@ import type { PipelineState, SourceKey, SourceStatus } from '../../shared/ipc.js
 import { api } from '../lib/api.js';
 import { ago } from '../lib/format.js';
 import { cn } from '../lib/utils.js';
+import { EmptyState } from '../components/EmptyState.js';
 import { ProgressBar, ProgressPanel } from '../components/ProgressPanel.js';
 import { StatusChip } from '../components/StatusChip.js';
 import { Button } from '../components/ui/button.js';
@@ -26,7 +27,7 @@ export function Pipeline({ onNavigate }: { onNavigate: (screen: string) => void 
   const [confirm, setConfirm] = useState<SourceStatus | null>(null);
   const [dismissed, setDismissed] = useState<string[]>([]);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: PIPELINE_KEY,
     queryFn: () => api.getPipeline(),
     refetchInterval: (query) => (query.state.data?.running ? 750 : 4000),
@@ -152,6 +153,15 @@ export function Pipeline({ onNavigate }: { onNavigate: (screen: string) => void 
         <div className="min-h-0 overflow-y-auto">
           {isLoading ? (
             <div className="text-sm text-muted-foreground">Loading sources…</div>
+          ) : isError ? (
+            // Without this the screen rendered an empty grid: no sources, no
+            // error, nothing to click.
+            <EmptyState
+              icon={<AlertTriangle />}
+              title="Could not load the pipeline"
+              description={String((error as Error)?.message ?? '')}
+              action={{ label: 'Try again', onClick: () => void refetch() }}
+            />
           ) : (
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3">
               {sources.map((s) => (

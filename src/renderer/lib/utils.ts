@@ -76,6 +76,64 @@ export const isMac =
 
 export const MOD = isMac ? '⌘' : 'Ctrl';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Event-target classification for the screen-level hotkeys
+//
+// Both walk the ancestor chain by hand rather than calling `Element.closest`,
+// which keeps them pure enough to unit-test against a plain object chain under
+// node — there is no DOM in the test runner.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ElementLike {
+  tagName?: string;
+  getAttribute?(name: string): string | null;
+  parentElement?: ElementLike | null;
+}
+
+const ACTIVATION_TAGS = new Set(['BUTTON', 'A', 'SUMMARY']);
+const ACTIVATION_ROLES = new Set([
+  'button',
+  'switch',
+  'checkbox',
+  'combobox',
+  'menuitem',
+  'radio',
+  'tab',
+  'link',
+]);
+
+function* ancestors(target: unknown): Generator<ElementLike> {
+  for (let el = target as ElementLike | null | undefined; el; el = el.parentElement) yield el;
+}
+
+/**
+ * True when the event originated on something the browser activates with the
+ * space bar. The `space` hotkey must not `preventDefault` over those, or a
+ * focused button can never be pressed from the keyboard.
+ */
+export function isActivationTarget(target: unknown): boolean {
+  for (const el of ancestors(target)) {
+    if (el.tagName && ACTIVATION_TAGS.has(el.tagName.toUpperCase())) return true;
+    const role = el.getAttribute?.('role');
+    if (role && ACTIVATION_ROLES.has(role)) return true;
+  }
+  return false;
+}
+
+/**
+ * True inside a Radix popover/dropdown/dialog layer. Those own the keyboard
+ * while they are open, so a screen hotkey (`a` approves, `x` rejects) must not
+ * also fire at the record behind them.
+ */
+export function isInOverlayLayer(target: unknown): boolean {
+  for (const el of ancestors(target)) {
+    if (el.getAttribute?.('data-radix-popper-content-wrapper') != null) return true;
+    const role = el.getAttribute?.('role');
+    if (role === 'dialog' || role === 'alertdialog') return true;
+  }
+  return false;
+}
+
 export function safeLocalGet(key: string): string | null {
   try {
     return localStorage.getItem(key);

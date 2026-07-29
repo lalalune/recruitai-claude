@@ -41,6 +41,7 @@ import {
   useLinkedInStatus,
 } from '../lib/api.js';
 import { cn } from '../lib/utils.js';
+import { EmptyState } from '../components/EmptyState.js';
 import { Section } from '../components/Section.js';
 import { StatusChip } from '../components/StatusChip.js';
 import { Button } from '../components/ui/button.js';
@@ -638,11 +639,26 @@ function LinkedInPanel({ settings }: { settings: SettingsShape }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function Settings() {
-  const { data: settings, isLoading } = useSettings();
+  const { data: settings, isLoading, isError, error, refetch } = useSettings();
   const patch = useSettingsPatch();
 
-  if (isLoading || !settings) {
+  if (isLoading) {
     return <div className="p-8 text-sm text-muted-foreground">Loading settings…</div>;
+  }
+
+  // Without this branch a failed getSettings left the screen on "Loading
+  // settings…" for good: the query is no longer loading and `settings` is still
+  // undefined, so the operator gets no error, no retry, and no way to reconnect
+  // Gmail or fix a key.
+  if (isError || !settings) {
+    return (
+      <EmptyState
+        icon={<AlertTriangle />}
+        title="Could not load settings"
+        description={String((error as Error)?.message ?? 'The main process returned nothing.')}
+        action={{ label: 'Try again', onClick: () => void refetch() }}
+      />
+    );
   }
 
   return (

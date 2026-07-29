@@ -138,8 +138,12 @@ export function backoffMs(attempts: number): number {
 }
 
 /**
- * A crash leaves tasks stuck in 'running'. Anything claimed longer ago than
- * `staleMs` is returned to the queue on the next startup.
+ * A crash leaves tasks stuck in 'running'. At startup the single-instance lock
+ * guarantees no other process can be mid-task, so callers pass staleMs = 0 and
+ * every 'running' row is requeued regardless of age — the old 30-minute floor
+ * left a crash-then-quick-relaunch task wedged (and its dedupe key blocked
+ * re-enqueueing the same work) until some later restart. The floor exists for
+ * any future PERIODIC caller, where an in-flight task really could be running.
  */
 export function requeueStale(db: Db, staleMs = 30 * 60_000): number {
   const cutoff = Date.now() - staleMs;
@@ -276,6 +280,28 @@ export function releaseApiCall(db: Db, reservation: Reservation, reason: string)
     reservation.id,
   );
   void reason;
+}
+
+/**
+ * A crash between reserve and commit leaves rows 'reserved' forever: their
+ * est_cost_micros counts against the spend cap indefinitely, and ledger
+ * dedupe answers "already reserved" for work that never happened (the LLM
+ * body rewrite then silently falls back to the template forever). At startup
+ * the single-instance lock means every reserved row is an orphan. Marked
+ * 'failed' rather than deleted: failed rows keep the audit trail and are the
+ * state the verifier's no-credit-consumed reuse path already understands.
+ */
+export function releaseStaleReservations(db: Db): number {
+  const rows = all<{ id: number }>(
+    db,
+    `UPDATE api_call
+        SET state = 'failed', finished_at = ?,
+            error = COALESCE(error, 'Reservation orphaned by an interrupted run; released at startup.')
+      WHERE state = 'reserved'
+      RETURNING id`,
+    Date.now(),
+  );
+  return rows.length;
 }
 
 export function totalSpentMicros(db: Db): number {

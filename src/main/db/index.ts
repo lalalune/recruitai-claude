@@ -14,6 +14,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import schemaSql from './schema.sql';
+import { normName, canonicalCompanyValue } from '../pipeline/canon.js';
 
 export type Db = DatabaseSync;
 
@@ -25,19 +26,44 @@ export function openDb(file: string): Db {
 
   const db = new DatabaseSync(file, { enableForeignKeyConstraints: true });
 
+  // busy_timeout FIRST. Switching journal modes needs a brief exclusive lock, so
+  // a second connection opening while the first is mid-write fails outright
+  // without a busy handler already installed.
+  db.exec('PRAGMA busy_timeout = 5000');
   // Readers never block the writer and vice versa. Required because the UI reads
   // while the pipeline worker writes.
-  db.exec('PRAGMA journal_mode = WAL');
+  enableWal(db, file);
   // NORMAL is the right durability trade for a local research tool: safe against
   // process crash, at risk only from OS/power loss, which a re-run fixes.
   db.exec('PRAGMA synchronous = NORMAL');
-  db.exec('PRAGMA busy_timeout = 5000');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA cache_size = -65536'); // 64 MB
   db.exec('PRAGMA temp_store = MEMORY');
   db.exec('PRAGMA wal_autocheckpoint = 1000');
+  // journal_mode is a request, not a guarantee: on a filesystem without the
+  // shared-memory primitives WAL needs (most network mounts) SQLite silently
+  // stays in rollback-journal mode, where a writer blocks every reader and the
+  // UI freezes for the length of a crawl. Say so rather than let the operator
+  // discover it as "the app hangs".
+  const mode = get<{ journal_mode: string }>(db, 'PRAGMA journal_mode')?.journal_mode ?? '?';
+  if (mode.toLowerCase() !== 'wal') {
+    console.warn(
+      `[db] WARNING: journal_mode is '${mode}', not WAL (${file}).\n` +
+        `     Reads and writes will block each other. This usually means the database\n` +
+        `     is on a network or synced volume; move it with RECRUITAI_DATA.`,
+    );
+  }
 
-  migrate(db);
+  const fromVersion = migrate(db);
+  // A kill-9 inside bulkLoadReqs leaves the FTS triggers dropped forever —
+  // migrations are already applied, so nothing else would ever recreate them
+  // and search would silently miss every req written since the crash.
+  ensureFtsTriggers(db);
+  // name_norm predates the Unicode-aware normName (migration v3 era): recompute
+  // rows the old ASCII-only normaliser mangled, and re-canonicalise company
+  // suppression values in the same pass so both sides of the match move
+  // together. Fresh databases (fromVersion 0) have nothing to backfill.
+  if (fromVersion > 0 && fromVersion < 3) backfillUnicodeNorms(db);
   return db;
 }
 
@@ -85,26 +111,169 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE company ADD COLUMN ats_miss_count INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    // Measured at the 10k-company envelope: the sendable predicate and the
+    // inbox reply-matcher were scanning where they should seek. These four
+    // indexes plus the canonical-lowercase suppression invariant (enforced
+    // going forward by addSuppressionRow; normalised here for legacy rows)
+    // take the hot send/inbox paths from ~56ms and ~8s to sub-millisecond.
+    version: 3,
+    sql: `
+      CREATE INDEX send_contact ON send(contact_id);
+      CREATE INDEX inbound_unhandled ON inbound(send_id) WHERE handled = 0;
+      CREATE INDEX send_to_email ON send(lower(to_email), sent_at DESC);
+      CREATE INDEX field_observation_evidence ON field_observation(evidence_id) WHERE evidence_id IS NOT NULL;
+      CREATE INDEX api_call_spend ON api_call(actual_cost_micros, est_cost_micros) WHERE state IN ('reserved','succeeded');
+      UPDATE suppression SET value = lower(value);
+      ANALYZE;
+    `,
+  },
+  {
+    // The verifier's "have we already paid for this address?" cache looked up
+    // raw_response by (source, url) with only (source, fetched_at) to ride, so
+    // every lookup walked the whole verifier partition — and a MISS, which is
+    // the common case for a new address, walked all of it. Measured at 20k
+    // stored verdicts: 3.3ms per address before, 0.003ms after, and the old
+    // cost grows linearly with every address ever verified.
+    version: 4,
+    sql: `
+      CREATE INDEX raw_source_url ON raw_response(source, url, fetched_at DESC);
+      ANALYZE raw_response;
+    `,
+  },
 ];
 
-function migrate(db: Db): void {
-  const row = db.prepare('PRAGMA user_version').get() as { user_version: number };
-  const current = row?.user_version ?? 0;
+/** The newest schema this build knows how to produce and read. */
+export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
+
+function userVersion(db: Db): number {
+  return (db.prepare('PRAGMA user_version').get() as { user_version: number } | undefined)?.user_version ?? 0;
+}
+
+/** Returns the version the database was at BEFORE any migrations ran. */
+function migrate(db: Db): number {
+  const startedAt = userVersion(db);
+
+  // Downgrades are the dangerous direction and the silent one: an older build
+  // sees a newer file, has no migration left to run, and happily writes rows
+  // that ignore columns and constraints it does not know about. Refuse instead.
+  if (startedAt > SCHEMA_VERSION) {
+    throw new Error(
+      `Database is schema v${startedAt} but this build of recruitAI only understands v${SCHEMA_VERSION}. ` +
+        `It was written by a newer version. Refusing to open it — continuing would write rows that ` +
+        `ignore the newer schema. Update the app, or point RECRUITAI_DATA at a different folder.`,
+    );
+  }
 
   for (const m of MIGRATIONS) {
-    if (m.version <= current) continue;
-    // node:sqlite exec() runs multiple statements; wrap so a bad migration
-    // leaves the database untouched rather than half-applied.
-    db.exec('BEGIN');
+    if (m.version <= startedAt) continue;
+    // BEGIN IMMEDIATE, not BEGIN: a deferred transaction only takes the write
+    // lock at its first write, which leaves the read of user_version outside
+    // any lock. Two processes starting together (the app and `bun run seed`,
+    // say) would then both decide to apply the same migration, and the loser
+    // dies on "table already exists" — with node:sqlite exec() running the
+    // whole script, a partial apply. Re-reading the version under the write
+    // lock makes check-and-set atomic; the second process just skips.
+    db.exec('BEGIN IMMEDIATE');
     try {
+      if (userVersion(db) >= m.version) {
+        db.exec('COMMIT');
+        continue;
+      }
       db.exec(m.sql);
       db.exec(`PRAGMA user_version = ${m.version}`);
       db.exec('COMMIT');
     } catch (err) {
-      db.exec('ROLLBACK');
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // A statement error can unwind the transaction itself; letting the
+        // rollback throw here would replace the real migration failure with
+        // "no transaction is active".
+      }
       throw new Error(`Migration ${m.version} failed: ${err}`);
     }
   }
+  return startedAt;
+}
+
+/**
+ * Recreate the req FTS triggers if any are missing and resync the index.
+ * Idempotent and cheap when all three exist (the normal case).
+ */
+export function ensureFtsTriggers(db: Db): void {
+  const present =
+    get<{ n: number }>(
+      db,
+      `SELECT count(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name IN ('req_ai','req_au','req_ad')`,
+    )?.n ?? 0;
+  if (present === 3) return;
+
+  const triggers = schemaSql.match(/CREATE TRIGGER req_a[iud][\s\S]*?END;/g) ?? [];
+  tx(db, () => {
+    for (const t of triggers) db.exec(t.replace('CREATE TRIGGER', 'CREATE TRIGGER IF NOT EXISTS'));
+    // Rows written while the triggers were missing never reached req_fts.
+    db.exec("INSERT INTO req_fts(req_fts) VALUES('rebuild')");
+  });
+}
+
+/**
+ * One-time repair after normName became Unicode-aware: recompute name_norm
+ * where the old ASCII-only algorithm disagrees, and re-shape stored company
+ * suppression values with the same rules (their old fallback form — the raw
+ * lowercased name — matched no arm of COMPANY_SUPPRESSION_MATCH, i.e. the
+ * suppression silently did not suppress).
+ */
+export function backfillUnicodeNorms(db: Db): void {
+  tx(db, () => {
+    const companies = all<{ id: string; name: string; name_norm: string }>(
+      db,
+      'SELECT id, name, name_norm FROM company',
+    );
+    for (const c of companies) {
+      const norm = normName(c.name);
+      if (norm !== c.name_norm) run(db, 'UPDATE company SET name_norm = ? WHERE id = ?', norm, c.id);
+    }
+    const sups = all<{ id: number; value: string }>(db, `SELECT id, value FROM suppression WHERE kind = 'company'`);
+    for (const s of sups) {
+      const canon = canonicalCompanyValue(s.value);
+      if (canon === s.value) continue;
+      try {
+        run(db, 'UPDATE suppression SET value = ? WHERE id = ?', canon, s.id);
+      } catch {
+        // UNIQUE(kind, value): the canonical row already exists — this one is
+        // a now-redundant duplicate.
+        run(db, 'DELETE FROM suppression WHERE id = ?', s.id);
+      }
+    }
+  });
+}
+
+/**
+ * Switching a database into WAL takes a brief exclusive lock, and — unlike an
+ * ordinary write — that switch does not run the busy handler, so busy_timeout
+ * does not cover it. Two processes opening a database that is not yet in WAL at
+ * the same moment (first launch, or the app and `bun run seed` starting
+ * together) leaves one of them throwing "database is locked" out of openDb
+ * before it has done anything at all. Measured 6-of-6 failures on a cold file.
+ * So do the waiting here instead.
+ */
+function enableWal(db: Db, file: string): void {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      db.exec('PRAGMA journal_mode = WAL');
+      return;
+    } catch (err) {
+      if (Date.now() >= deadline) throw new Error(`Could not switch ${file} to WAL mode: ${err}`);
+      sleepSync(20);
+    }
+  }
+}
+
+/** node:sqlite is synchronous, so the retry backoff has to be too. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
@@ -227,7 +396,20 @@ export function dbStats(db: Db): { sizeBytes: number; tables: Record<string, num
   for (const { name } of names) {
     tables[name] = get<{ c: number }>(db, `SELECT count(*) c FROM "${name}"`)?.c ?? 0;
   }
-  return { sizeBytes: pageCount * pageSize, tables };
+  // page_count covers the main file only. Between checkpoints the -wal holds
+  // committed data too and routinely reaches tens of MB, so reporting page
+  // count alone understates what the operator is actually using on disk.
+  return { sizeBytes: pageCount * pageSize + walBytes(db), tables };
+}
+
+function walBytes(db: Db): number {
+  const file = get<{ file: string | null }>(db, `SELECT file FROM pragma_database_list WHERE name = 'main'`)?.file;
+  if (!file) return 0; // in-memory or temp database
+  try {
+    return fs.statSync(`${file}-wal`).size;
+  } catch {
+    return 0; // checkpointed away, or not in WAL mode
+  }
 }
 
 /**

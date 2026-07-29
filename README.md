@@ -131,4 +131,7 @@ More detail in [PLAN.md §5](PLAN.md).
 
 ## License
 
-MIT. The code is open; your data is yours and stays on your machine.
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Third-party attributions are in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
+
+The code is open; your data is yours and stays on your machine.

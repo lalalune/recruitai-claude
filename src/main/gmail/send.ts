@@ -22,6 +22,7 @@ import {
   GmailAuthError,
 } from './oauth.js';
 import { buildRawMessage, SEND_ID_HEADER, headerValue, extractMessageId } from './mime.js';
+import { redactError } from './redact.js';
 
 export interface SendRequest {
   to: string;
@@ -80,8 +81,8 @@ export function assertNotSuppressed(email: string, companyId?: string): void {
   const hit = prep(
     getDb(),
     `SELECT s.reason FROM suppression s
-      WHERE (s.kind = 'email'  AND lower(s.value) = ?)
-         OR (s.kind = 'domain' AND lower(s.value) = ?)
+      WHERE (s.kind = 'email'  AND s.value = ?)
+         OR (s.kind = 'domain' AND s.value = ?)
          OR (s.kind = 'company' AND ? IS NOT NULL AND EXISTS (
                SELECT 1 FROM company co WHERE co.id = ? AND ${COMPANY_SUPPRESSION_MATCH}))
       LIMIT 1`,
@@ -185,7 +186,7 @@ async function readBackMessageId(gmailId: string): Promise<string | null> {
     );
     return extractMessageId(headerValue(res.data.payload?.headers, 'Message-ID'));
   } catch (err) {
-    console.warn(`[gmail] could not read back Message-ID for ${gmailId}:`, err);
+    console.warn(`[gmail] could not read back Message-ID for ${gmailId}:`, redactError(err));
     return null;
   }
 }

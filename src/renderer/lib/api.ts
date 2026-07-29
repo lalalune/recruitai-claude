@@ -17,7 +17,7 @@ import {
   type QueryClient,
   type UseQueryOptions,
 } from '@tanstack/react-query';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 
 import type {
@@ -173,15 +173,30 @@ export function useCompanies() {
   });
 }
 
+/** Trailing debounce. `value` settles `ms` after the last change. */
+function useDebounced<T>(value: T, ms: number): T {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setSettled(value), ms);
+    return () => clearTimeout(t);
+  }, [value, ms]);
+  return settled;
+}
+
 /**
- * Server-side search ids, debounced by react-query's key change. The client
- * filter stays instant (it never waits on IPC); this AUGMENTS it with matches
- * the rows can't see — contact names/emails and req titles (FTS5) live only
- * in the main process. Union of both sets is what the operator perceives as
- * "search everything", per UX.md §5.2.
+ * Server-side search ids. The client filter stays instant (it never waits on
+ * IPC); this AUGMENTS it with matches the rows can't see — contact
+ * names/emails and req titles (FTS5) live only in the main process. Union of
+ * both sets is what the operator perceives as "search everything", per
+ * UX.md §5.2.
+ *
+ * The term is debounced because a new react-query key is NOT a debounce: every
+ * keystroke would otherwise fire its own `listCompanies({search})` across IPC,
+ * and a two-letter term matches most of a 5,000-row table — megabytes per
+ * keypress, serialised through a synchronous SQLite main process.
  */
 export function useServerSearchIds(search: string): Set<string> | null {
-  const term = search.trim();
+  const term = useDebounced(search.trim(), 220);
   const { data } = useQuery({
     queryKey: ['companies', 'search', term],
     queryFn: () => api.listCompanies({ search: term, limit: 1_000_000 }),

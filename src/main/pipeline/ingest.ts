@@ -21,6 +21,7 @@ import {
   resolveAtsFromCareersPage,
   candidateTokens,
   extractEmails,
+  MULTI_PART_SUFFIXES,
   type YcCompany,
 } from '../sources/seeds.js';
 import { findCompanyLinkedIn } from '../sources/social.js';
@@ -34,17 +35,6 @@ import type { RunCtx, SourceOutcome } from './run.js';
 // ─────────────────────────────────────────────────────────────────────────────
 // Domain / naming
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Second-level public suffixes we actually encounter. A full Public Suffix List
- * is overkill for a Bay-Area startup database; getting `co.uk` and friends right
- * covers the real cases and a mis-split here only costs us one merge.
- */
-const MULTI_PART_SUFFIXES = new Set([
-  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'com.au', 'net.au', 'org.au', 'co.nz',
-  'co.jp', 'co.kr', 'com.br', 'com.mx', 'com.ar', 'co.in', 'co.za', 'com.sg',
-  'com.hk', 'com.tw', 'com.tr', 'co.il', 'com.cn', 'co.id', 'com.ua', 'co.th',
-]);
 
 /**
  * Domains that are never a company identity. Keying on any of these silently
@@ -92,14 +82,10 @@ export function etldPlusOne(input: string | null | undefined): string | null {
   return registrable;
 }
 
-const LEGAL_SUFFIX_RE =
-  /[,.]?\s*\b(inc|incorporated|llc|l\.l\.c|ltd|limited|corp|corporation|co|gmbh|bv|sarl|pbc|plc|ag|oy|ab|as|pty|sa)\b\.?$/gi;
-
-export function normName(name: string): string {
-  let n = name.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
-  for (let i = 0; i < 3; i++) n = n.replace(LEGAL_SUFFIX_RE, '').trim();
-  return n.replace(/[^a-z0-9]+/g, ' ').trim();
-}
+// Lives in canon.ts (a leaf module) so db/index.ts can run the post-migration
+// Unicode backfill without importing this file and creating an import cycle.
+import { normName } from './canon.js';
+export { normName };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Evidence
@@ -443,11 +429,21 @@ export function findCompany(db: Db, seed: CompanySeed): string | null {
     if (byDomain) return canonicalCompanyId(db, byDomain.id);
   }
   const norm = normName(seed.name);
-  if (norm.length >= 3) {
+  if (norm.length >= 2) {
+    // A shared name is evidence of identity only while nothing contradicts it.
+    // Without the domain clause, three separate YC companies called "Scout"
+    // (scouthealth.com W22, thedailyscout.com W23, cpgscout.ai W24) collapsed
+    // into a single row whose batch, headcount and industry were whichever one
+    // happened to be ingested last — and because all three claims came from the
+    // same source, `conflicting` never fired to show it.
     const byName = get<{ id: string }>(
       db,
-      'SELECT id FROM company WHERE name_norm = ? ORDER BY (domain IS NULL), created_at LIMIT 1',
+      `SELECT id FROM company
+        WHERE name_norm = ? AND (? IS NULL OR domain IS NULL OR domain = ?)
+        ORDER BY (domain IS NULL), created_at LIMIT 1`,
       norm,
+      domain,
+      domain,
     );
     if (byName) return canonicalCompanyId(db, byName.id);
   }
@@ -521,6 +517,10 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
  * A req that vanishes is closed. A closed req that reappears increments
  * repost_count and restarts its clock — that pattern is a failed search, which
  * is the single strongest thing you can put in a cold email.
+ *
+ * `closeMissing: false` says `jobs` is a PREFIX of the board, not the board —
+ * pagination broke, or a page cap truncated it. Absence proves nothing then, so
+ * the roles present are still ingested and nothing is closed.
  */
 export function upsertReqs(
   db: Db,
@@ -529,6 +529,7 @@ export function upsertReqs(
   jobs: DiscoveredJob[],
   evidenceId: number | null,
   companyDomain: string | null,
+  opts: { closeMissing?: boolean } = {},
 ): ReqSyncResult {
   const now = Date.now();
   const today = Math.floor(now / 86_400_000);
@@ -635,11 +636,13 @@ export function upsertReqs(
     }
   }
 
-  for (const prior of existing) {
-    if (seen.has(prior.external_id) || prior.closed_at != null) continue;
-    run(db, 'UPDATE req SET closed_at = ? WHERE id = ?', now, prior.id);
-    markReqDay(db, prior.id, today, 0);
-    result.closed++;
+  if (opts.closeMissing !== false) {
+    for (const prior of existing) {
+      if (seen.has(prior.external_id) || prior.closed_at != null) continue;
+      run(db, 'UPDATE req SET closed_at = ? WHERE id = ?', now, prior.id);
+      markReqDay(db, prior.id, today, 0);
+      result.closed++;
+    }
   }
 
   recomputeDaysOpen(db, companyId, source, now);
@@ -891,8 +894,11 @@ export async function ingestAtsSweep(db: Db, ctx: RunCtx): Promise<SourceOutcome
           reposted += sync.reposted;
         }
       });
-    // FTS triggers dominate large inserts; drop and rebuild past a couple thousand.
-    if (jobs > 2000) bulkLoadReqs(db, write);
+    // FTS triggers tax large inserts ~6x, but the drop-and-rebuild path costs a
+    // FULL index rebuild in its finally block — proportional to the whole req
+    // corpus, not the batch (measured ~1.2 s at 100k reqs). Triggers win for
+    // refresh-sized flushes; reserve the rebuild for genuine bulk imports.
+    if (jobs > 20_000) bulkLoadReqs(db, write);
     else write();
     resolved += batch.length;
     totalJobs += jobs;
@@ -1025,7 +1031,11 @@ function persistBoard(db: Db, target: SweepTarget, board: AtsBoard): ReqSyncResu
   observeCompany(db, target.id, 'atsToken', board.token, board.platform, evidenceId, 'high');
   const careers = board.jobs[0]?.url ?? null;
   if (careers) observeCompany(db, target.id, 'careersUrl', careers, board.platform, evidenceId, 'medium');
-  return upsertReqs(db, target.id, board.platform, board.jobs, evidenceId, target.domain);
+  // A discovery probe can return a partial board too — SmartRecruiters
+  // paginates, and probeAts deliberately keeps the prefix it did fetch.
+  return upsertReqs(db, target.id, board.platform, board.jobs, evidenceId, target.domain, {
+    closeMissing: !board.partial,
+  });
 }
 
 function boardUrl(board: AtsBoard): string {
@@ -1116,8 +1126,9 @@ interface CrawlHit {
   platform: string;
   token: string;
   foundAt: string;
+  /** The careers page itself — the bytes the platform and token were read out of. */
+  pageBody: string;
   board: AtsBoard | null;
-  rawBody: string | null;
 }
 
 export async function ingestCareersCrawl(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
@@ -1154,19 +1165,36 @@ export async function ingestCareersCrawl(db: Db, ctx: RunCtx): Promise<SourceOut
     const write = () =>
       tx(db, () => {
         for (const f of batch) {
-          const evidenceId = storeRaw(db, 'careers_page', f.foundAt, 200, f.rawBody ?? f.foundAt);
-          observeCompany(db, f.target.id, 'atsPlatform', f.platform, 'careers_page', evidenceId, 'high');
-          observeCompany(db, f.target.id, 'atsToken', f.token, 'careers_page', evidenceId, 'high');
-          observeCompany(db, f.target.id, 'careersUrl', f.foundAt, 'careers_page', evidenceId, 'high');
+          // Two different documents, two different evidence rows. Filing the
+          // ATS payload under the careers-page URL — or, when there was no
+          // payload, filing the URL string as if it were a response body —
+          // breaks the one promise provenance makes: that following an
+          // evidence_id shows you the bytes the claim was read out of.
+          const pageEvidence = storeRaw(db, 'careers_page', f.foundAt, 200, f.pageBody);
+          observeCompany(db, f.target.id, 'atsPlatform', f.platform, 'careers_page', pageEvidence, 'high');
+          observeCompany(db, f.target.id, 'atsToken', f.token, 'careers_page', pageEvidence, 'high');
+          observeCompany(db, f.target.id, 'careersUrl', f.foundAt, 'careers_page', pageEvidence, 'high');
           resolved++;
           if (f.board) {
-            const r = upsertReqs(db, f.target.id, f.board.platform, f.board.jobs, evidenceId, f.target.domain);
+            const boardEvidence = storeRaw(db, f.board.platform, boardUrl(f.board), 200, f.board.rawBody);
+            const r = upsertReqs(
+              db,
+              f.target.id,
+              f.board.platform,
+              f.board.jobs,
+              boardEvidence,
+              f.target.domain,
+              { closeMissing: !f.board.partial },
+            );
             roles += r.opened + r.updated + r.reposted;
           }
         }
       });
-    // FTS triggers dominate large inserts; drop and rebuild past a couple thousand.
-    if (jobs > 2000) bulkLoadReqs(db, write);
+    // FTS triggers tax large inserts ~6x, but the drop-and-rebuild path costs a
+    // FULL index rebuild in its finally block — proportional to the whole req
+    // corpus, not the batch (measured ~1.2 s at 100k reqs). Triggers win for
+    // refresh-sized flushes; reserve the rebuild for genuine bulk imports.
+    if (jobs > 20_000) bulkLoadReqs(db, write);
     else write();
   };
 
@@ -1196,22 +1224,30 @@ export async function ingestCareersCrawl(db: Db, ctx: RunCtx): Promise<SourceOut
         // No adapter (workday, rippling, …) or the platform told us to stop:
         // still record the resolved platform+token — the sweep's refresh pass
         // fetches the board once the host is willing again.
-        push({ target, platform: probe.platform, token: probe.token, foundAt: probe.foundAt, board: null, rawBody: null });
+        push({
+          target,
+          platform: probe.platform,
+          token: probe.token,
+          foundAt: probe.foundAt,
+          pageBody: probe.pageBody,
+          board: null,
+        });
         return null;
       }
       try {
         const result = await fetcher(probe.token);
         // A 429/403 blocks that one platform for the rest of the crawl, never
         // the others. SmartRecruiters can 429 on page 2+ with page 1 in hand;
-        // that partial board is real data and is kept.
+        // that partial board is real data and is kept — but it is flagged, so
+        // the differ ingests its roles without closing anything.
         if (result.httpStatus === 429 || result.httpStatus === 403) blockedPlatforms.add(platform);
         push({
           target,
           platform: probe.platform,
           token: probe.token,
           foundAt: probe.foundAt,
+          pageBody: probe.pageBody,
           board: result.ok ? result.data : null,
-          rawBody: result.rawBody ?? null,
         });
       } catch (err) {
         if (isBlockSignal(err)) blockedPlatforms.add(platform);

@@ -134,8 +134,12 @@ export function listCompanies(db: Db, params: CompanyListParams = {}): CompanyRo
     ];
     args.push(like, like, like, like);
     if (fts) {
+      // Decorrelated on purpose: IN (…) runs the FTS MATCH once for the whole
+      // query. The correlated form (`req_fts MATCH ? AND r.company_id = c.id`)
+      // re-executed the match per candidate row — measured 11–23 s per
+      // keystroke at 10k companies vs ~100 ms for this shape.
       clauses.push(
-        `EXISTS (SELECT 1 FROM req_fts JOIN req r ON r.id = req_fts.rowid WHERE req_fts MATCH ? AND r.company_id = c.id)`,
+        `c.id IN (SELECT r.company_id FROM req r JOIN req_fts ON req_fts.rowid = r.id WHERE req_fts MATCH ?)`,
       );
       args.push(fts);
     }

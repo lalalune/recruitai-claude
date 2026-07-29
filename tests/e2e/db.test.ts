@@ -23,6 +23,7 @@ import {
   backup,
   dbStats,
   bulkLoadReqs,
+  SCHEMA_VERSION,
   type Db,
 } from '../../src/main/db/index.js';
 import { enqueue, claim, reserveApiCall } from '../../src/main/pipeline/tasks.js';
@@ -142,8 +143,12 @@ after(() => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Keep in lockstep with the MIGRATIONS list in src/main/db/index.ts. */
-const CURRENT_SCHEMA_VERSION = 2;
+/**
+ * Read from the MIGRATIONS list rather than restated here. A hand-kept copy
+ * broke this whole file every time a migration was added, which trains people
+ * to bump the number instead of asking whether the migration was right.
+ */
+const CURRENT_SCHEMA_VERSION = SCHEMA_VERSION;
 
 describe('migration', () => {
   test('applies the schema from scratch and stamps user_version', () => {

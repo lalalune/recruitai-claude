@@ -64,8 +64,13 @@ export default function App() {
     preventDefault: true,
   });
 
+  // Both spellings are needed. On every layout where `?` is Shift+something the
+  // event carries shiftKey, and a bare '?' binding is rejected for having no
+  // shift modifier — so the documented shortcut would never fire at all. The
+  // plain '?' covers the layouts where it is unshifted. Exactly one can match a
+  // given event, so this cannot double-toggle.
   useHotkeys(
-    '?',
+    ['shift+?', '?'],
     () => setShortcutsOpen(!useUi.getState().shortcutsOpen),
     { useKey: true, preventDefault: true },
     [setShortcutsOpen],

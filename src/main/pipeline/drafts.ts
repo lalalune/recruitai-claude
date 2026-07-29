@@ -533,8 +533,8 @@ function loadTarget(db: Db, companyId: string, contactId?: string): DraftTarget 
         AND (? IS NULL OR c.id = ?)
         AND NOT EXISTS (
           SELECT 1 FROM suppression s
-           WHERE (s.kind = 'email'   AND lower(s.value) = lower(c.email))
-              OR (s.kind = 'domain'  AND lower(s.value) = lower(substr(c.email, instr(c.email, '@') + 1)))
+           WHERE (s.kind = 'email'   AND s.value = lower(c.email))
+              OR (s.kind = 'domain'  AND s.value = lower(substr(c.email, instr(c.email, '@') + 1)))
               OR (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH})
         )
       ORDER BY c.is_primary DESC, c.contact_score DESC, c.created_at
