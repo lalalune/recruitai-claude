@@ -71,7 +71,10 @@
     "vite": "8.1.5",
     "wait-on": "9.1.0"
   },
-  "author": "Shaw Walters",
+  "author": {
+    "name": "Shaw Walters",
+    "email": "shawmakesmagic@gmail.com"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lalalune/recruitai-claude.git"
