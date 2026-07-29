@@ -1,6 +1,6 @@
 {
   "name": "recruitai",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Local-first lead engine: find SF Bay Area startups that are hiring, plus the people who decide to hire an agency.",
