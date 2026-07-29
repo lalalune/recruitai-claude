@@ -124,6 +124,15 @@ async function main(): Promise<void> {
   await app.whenReady();
   const win = await waitFor('BrowserWindow', 15_000, () => BrowserWindow.getAllWindows()[0]);
   await waitFor('page load', 15_000, () => !win.webContents.isLoading() || undefined);
+
+  // A pristine profile (CI) correctly lands on the Setup wizard; the loop
+  // under test is Review's. Mark setup complete exactly as Setup's skip
+  // button does, then reload — unconditional, so local machines with stale
+  // Electron userData and fresh CI runners behave identically.
+  await win.webContents.executeJavaScript(`localStorage.setItem('recruitai.setupComplete', '1')`);
+  win.webContents.reload();
+  await new Promise((r) => setTimeout(r, 300));
+  await waitFor('reload complete', 15_000, () => !win.webContents.isLoading() || undefined);
   win.webContents.focus();
 
   // The seeded list must actually render.
