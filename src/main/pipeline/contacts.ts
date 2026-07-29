@@ -338,10 +338,6 @@ function bodyOf(row: { id: number; body: Uint8Array | null; encoding: string }):
   return text;
 }
 
-export function clearEvidenceCache(): void {
-  bodyCache.clear();
-}
-
 function belongsToDomain(email: string, domain: string): boolean {
   const d = domainOf(email);
   return d === domain || d.endsWith(`.${domain}`);

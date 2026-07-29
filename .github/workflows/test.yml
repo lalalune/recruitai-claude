@@ -34,9 +34,12 @@ jobs:
 
       - run: bun run build
 
-      # Real Electron boot: main process + preload + built renderer over IPC.
+      # Real Electron boot + the primary-loop drive (seeded DB, real keystrokes
+      # through Chromium's input pipeline, approval → drainer → draft).
       - if: runner.os == 'macOS'
-        run: bun run test:boot
+        run: |
+          bun run test:boot
+          bun run test:loop
 
       - if: runner.os == 'Linux'
         run: |
@@ -47,5 +50,6 @@ jobs:
           sudo chown root:root node_modules/electron/dist/chrome-sandbox
           sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
           xvfb-run -a bun run test:boot
+          xvfb-run -a bun run test:loop
       # Windows: unit/e2e suites cover it; a headed Electron boot on the
       # Windows runner is flaky enough to cost more signal than it adds.

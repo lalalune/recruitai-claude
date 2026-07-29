@@ -95,10 +95,6 @@ export function setSetting(key: string, value: unknown): void {
   );
 }
 
-export function deleteSetting(key: string): void {
-  run(getDb(), 'DELETE FROM setting WHERE key = ?', key);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Data directory
 // ─────────────────────────────────────────────────────────────────────────────

@@ -81,10 +81,6 @@ export function dataDir(): string {
 
 let mainWindow: BrowserWindow | null = null;
 
-export function getMainWindow(): BrowserWindow | null {
-  return mainWindow;
-}
-
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1440,

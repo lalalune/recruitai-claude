@@ -152,27 +152,6 @@ export function verdictTone(v: string | null | undefined): Tone {
   }
 }
 
-export function statusTone(status: string | null | undefined): Tone {
-  switch (status) {
-    case 'approved':
-    case 'replied':
-    case 'sent':
-      return 'green';
-    case 'rejected':
-    case 'suppressed':
-    case 'bounced':
-      return 'red';
-    case 'scored':
-    case 'enriched':
-    case 'queued':
-      return 'blue';
-    case 'contacted':
-      return 'amber';
-    default:
-      return 'default';
-  }
-}
-
 export function titleCase(s: string): string {
   return s
     .replace(/[_-]+/g, ' ')

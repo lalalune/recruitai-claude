@@ -33,6 +33,7 @@ import {
   COMPANY_MATCHES_VALUE,
   COMPANY_SUPPRESSION_MATCH,
 } from '../pipeline/suppression.js';
+import { verifierProviderSchema } from '../../shared/schemas.js';
 import { auditLog } from './companies.js';
 import { addSuppressionRow } from './outreach.js';
 import * as gmail from '../gmail/index.js';
@@ -43,7 +44,6 @@ import type { DashboardStats, SettingsPatch, SuppressionRow } from '../../shared
 // Suppression
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERIFIER_PROVIDERS = new Set(['reoon', 'bouncer', 'millionverifier', 'none']);
 
 const SUPPRESSION_KINDS = new Set(['domain', 'email', 'company']);
 const SUPPRESSION_REASONS = new Set([
@@ -531,7 +531,9 @@ export function registerSettingsIpc(): void {
     // of verification provider rides the same channel as the key it selects;
     // it is stored as an ordinary setting rather than encrypted.
     if (raw === 'verifier_provider' || raw === 'verifierprovider') {
-      const provider = VERIFIER_PROVIDERS.has(value) ? value : 'none';
+      // One provider list for the whole app: the zod enum, not a shadow Set.
+      const parsed = verifierProviderSchema.safeParse(value);
+      const provider = parsed.success ? parsed.data : 'none';
       setSetting('keys.verifierProvider', provider);
       auditLog(getDb(), {
         actor: 'operator',

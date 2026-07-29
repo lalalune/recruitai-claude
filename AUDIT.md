@@ -172,6 +172,7 @@ bun run typecheck
 bun run test                       # expect 0 fail; exactly 1 gated skip
 bun run build
 bun run test:boot                  # real Electron boot e2e
+bun run test:loop                  # PRIMARY LOOP: seeded DB, real keystrokes (j/k/a), approval → drainer → draft
 RECRUITAI_NET=1 bun run test "parses a real Greenhouse"   # live API
 bun run smoke                      # live YC directory → live ATS probes → scored reqs
 ```
@@ -179,10 +180,15 @@ bun run smoke                      # live YC directory → live ATS probes → s
 `bun run smoke` uses `RECRUITAI_SMOKE_DATA` (never `RECRUITAI_DATA`) and owns
 its directory via a marker file — keep it that way. If a live endpoint drifted,
 update `VERIFIED-SOURCES.md` with the measured reality, then fix the adapter.
-Finally, launch the app (`bun run dev`) and drive the primary loop once by
-hand or harness: Setup → run a source → Review j/k/a → draft appears →
-queue → (test-send to self). A feature that demos is a different thing from a
-feature that compiles.
+
+The primary-loop drive is automated: `bun run test:loop` seeds a fresh
+database, boots the real app, and sends real keystrokes through Chromium's
+input pipeline — j/k must move the selection, `a` must approve (verified in
+the database from a second WAL connection), and the approval must flow
+through the task queue into a drainer-generated draft visible over live IPC.
+A feature that demos is a different thing from a feature that compiles; this
+harness is the demo, headless. For anything the harness doesn't cover, launch
+`bun run dev` and drive it by hand.
 
 ### Phase 5 — Close the loop
 
@@ -201,6 +207,7 @@ feature that compiles.
 | Typecheck | Whole repo (src + tests + scripts), zero errors |
 | Suite | Zero failures; the only skip is the `RECRUITAI_NET` gate |
 | Boot e2e | Passes: DOM mounts, api surface complete, validator rejects garbage with a validation message, zero console errors |
+| Loop e2e | Passes: real keystrokes move/approve; approval → task queue → drainer → draft, DB-verified |
 | Live API | Gated Greenhouse test passes against the real endpoint |
 | Live smoke | Real YC → real boards → scored reqs, end to end |
 | Reachability | Every exported production symbol has a caller or a removal justification |

@@ -633,26 +633,6 @@ export function useDisconnectLinkedIn() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function useAddSuppression() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({
-      kind,
-      value,
-      reason,
-      note,
-    }: {
-      kind: string;
-      value: string;
-      reason: string;
-      note?: string;
-    }) => api.addSuppression(kind, value, reason, note),
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.suppressions }),
-    onError: (err) =>
-      toast.error('Could not suppress', { description: String((err as Error).message ?? err) }),
-  });
-}
-
 /** Screenshots are read from disk on demand and returned as data URLs. */
 export function useScreenshot(relPath: string | null) {
   return useQuery({

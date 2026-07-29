@@ -18,7 +18,7 @@ import { scoreAll, recomputeCompany } from './scoring.js';
 import { generateAllDrafts } from './drafts.js';
 import * as linkedin from '../linkedin/index.js';
 import { ingestLinkedInUrls } from './ingest.js';
-import { discoverContacts, verifyCompanyContacts, upsertContact } from './contacts.js';
+import { discoverContacts, verifyCompanyContacts, upsertContact, estimatePendingVerifications } from './contacts.js';
 import { observeCompany } from './ingest.js';
 import type { EventName, LogLine, PipelineState, RecruitEvents, SourceKey, SourceStatus } from '../../shared/ipc.js';
 
@@ -82,15 +82,6 @@ function gate(alias: string): string {
 const ENRICHMENT_GATE = gate('');
 const ENRICHMENT_GATE_CO = gate('co');
 
-function countUnverifiedContacts(db: Db): number {
-  const row = get<{ n: number }>(
-    db,
-    `SELECT count(*) AS n FROM contact c
-       JOIN company co ON co.id = c.company_id
-      WHERE c.email IS NOT NULL AND c.email_verdict = 'unverified' AND ${ENRICHMENT_GATE_CO}`,
-  );
-  return row?.n ?? 0;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Enrichment runners (gated, per-company)
@@ -346,7 +337,9 @@ const SOURCES: Record<SourceKey, SourceDef> = {
     defaultEnabled: true,
     requiresKey: 'verifier',
     estimateCostUsd: (db) => {
-      const n = countUnverifiedContacts(db);
+      // The freshness-aware estimator: counts stale re-verifications and
+      // pattern candidates too, matching what a run would actually spend.
+      const n = estimatePendingVerifications(db, 183);
       return n === 0 ? null : Math.round(n * VERIFY_USD_PER_EMAIL * 100) / 100;
     },
     run: runEmailVerify,
