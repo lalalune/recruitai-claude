@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { ArrowLeft, ArrowRight, Check, FolderOpen, Rocket } from 'lucide-react';
 import { api } from '../lib/api.js';
-import { cn } from '../lib/utils.js';
+import { cn, safeLocalGet, safeLocalRemove, safeLocalSet, SETUP_COMPLETE_KEY } from '../lib/utils.js';
 import { ProgressBar, ProgressPanel } from '../components/ProgressPanel.js';
 import { Button } from '../components/ui/button.js';
 import { GmailPanel, IcpFields, useSettings } from './Settings.js';
@@ -19,15 +19,6 @@ export interface SetupProps {
   onNavigate?(screen: string): void;
 }
 
-function navigate(screen: string, onNavigate?: (screen: string) => void) {
-  if (onNavigate) {
-    onNavigate(screen);
-    return;
-  }
-  window.dispatchEvent(new CustomEvent('recruitai:navigate', { detail: { screen } }));
-  window.location.hash = `#/${screen}`;
-}
-
 export function Setup({ open, onClose, onNavigate }: SetupProps = {}) {
   const qc = useQueryClient();
   // Controlled by default. An undefined `open` means "rendered as a screen", in
@@ -35,7 +26,7 @@ export function Setup({ open, onClose, onNavigate }: SetupProps = {}) {
   // staring at an empty window with no way to navigate out.
   const [visible, setVisible] = useState(() => open ?? true);
   const [step, setStep] = useState(() => {
-    const n = Number(localStorage.getItem(STEP_KEY));
+    const n = Number(safeLocalGet(STEP_KEY));
     return Number.isFinite(n) && n >= 0 && n < STEPS.length ? n : 0;
   });
 
@@ -44,16 +35,20 @@ export function Setup({ open, onClose, onNavigate }: SetupProps = {}) {
   }, [open]);
 
   useEffect(() => {
-    localStorage.setItem(STEP_KEY, String(step));
+    safeLocalSet(STEP_KEY, String(step));
   }, [step]);
 
   const { data: settings } = useSettings();
 
+  // Finishing (or skipping) is what marks setup done — App's transition check
+  // agrees, but this explicit write means the flag is set even if the app
+  // quits before another screen ever mounts.
   const finish = (goToReview: boolean) => {
-    localStorage.removeItem(STEP_KEY);
+    safeLocalRemove(STEP_KEY);
+    safeLocalSet(SETUP_COMPLETE_KEY, '1');
     setVisible(false);
     onClose?.();
-    if (goToReview) navigate('review', onNavigate);
+    if (goToReview) onNavigate?.('review');
   };
 
   const runFirstPass = useMutation({

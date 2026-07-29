@@ -14,8 +14,8 @@
  */
 
 import { getDb } from '../db/index.js';
-import { claim, complete, fail, requeueStale } from './tasks.js';
-import { generateDraftFor } from './drafts.js';
+import { bury, claim, complete, fail, requeueStale } from './tasks.js';
+import { generateDraftFor, DraftNotPossible } from './drafts.js';
 import { emitEvent, appendLog } from './run.js';
 
 export const TASK_GENERATE_DRAFT = 'generate_draft';
@@ -33,8 +33,20 @@ const HANDLERS: Record<string, Handler> = {
     const companyId = String(payload.companyId ?? '');
     if (!companyId) throw new Error('generate_draft task has no companyId');
     const db = getDb();
-    const draft = await generateDraftFor(db, companyId);
-    if (draft) emitEvent('data:changed', { entity: 'draft', id: draft.id });
+    try {
+      const draft = await generateDraftFor(db, companyId);
+      if (draft) emitEvent('data:changed', { entity: 'draft', id: draft.id });
+    } catch (err) {
+      // "Cannot draft" is a business state (already sent → use follow-ups,
+      // operator-edited draft, no open req), not a transient failure —
+      // retrying it five times into dead-letter noise helps nobody.
+      // generateAllDrafts treats the same class as a benign skip.
+      if (err instanceof DraftNotPossible) {
+        appendLog('pipeline', 'info', `Draft skipped for ${companyId}: ${err.message}`);
+        return;
+      }
+      throw err;
+    }
   },
 };
 
@@ -55,9 +67,9 @@ async function drainOnce(): Promise<void> {
 
       const handler = HANDLERS[task.kind];
       if (!handler) {
-        // Unknown kind is a bug, not a transient failure. Retrying forever would
-        // hide it, so bury it immediately and say so.
-        fail(db, task.id, new Error(`No handler registered for task kind "${task.kind}"`));
+        // Unknown kind is a bug, not a transient failure. Retrying would only
+        // repeat it, so dead-letter in one step — fail() would retry 4 times.
+        bury(db, task.id, new Error(`No handler registered for task kind "${task.kind}"`));
         appendLog('pipeline', 'error', `Unknown task kind "${task.kind}" — buried.`);
         continue;
       }

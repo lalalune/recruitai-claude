@@ -132,16 +132,24 @@ before(() => {
 });
 
 after(() => {
-  if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true });
+  try {
+    if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch {
+    /* Windows holds handles past close() long enough to defeat retries — a
+       leaked CI tmpdir must not fail the suite (same stance as the stub). */
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Keep in lockstep with the MIGRATIONS list in src/main/db/index.ts. */
+const CURRENT_SCHEMA_VERSION = 2;
 
 describe('migration', () => {
   test('applies the schema from scratch and stamps user_version', () => {
     const db = freshDb('migrate');
     try {
-      assert.equal(get<{ user_version: number }>(db, 'PRAGMA user_version')?.user_version, 1);
+      assert.equal(get<{ user_version: number }>(db, 'PRAGMA user_version')?.user_version, CURRENT_SCHEMA_VERSION);
 
       const names = tableNames(db);
       for (const t of BASE_TABLES) assert.ok(names.includes(t), `missing table: ${t}`);
@@ -169,7 +177,7 @@ describe('migration', () => {
     // exists"; surviving data proves the guard, not just a silent no-op.
     const second = openDb(file);
     try {
-      assert.equal(get<{ user_version: number }>(second, 'PRAGMA user_version')?.user_version, 1);
+      assert.equal(get<{ user_version: number }>(second, 'PRAGMA user_version')?.user_version, CURRENT_SCHEMA_VERSION);
       assert.equal(get<{ n: number }>(second, 'SELECT count(*) AS n FROM company')?.n, 1);
       assert.equal(get<{ name: string }>(second, 'SELECT name FROM company WHERE id = ?', 'C_KEEP')?.name, 'Keepsake');
     } finally {
@@ -534,7 +542,7 @@ describe('backup', () => {
 
       const copy = openDb(dest);
       try {
-        assert.equal(get<{ user_version: number }>(copy, 'PRAGMA user_version')?.user_version, 1);
+        assert.equal(get<{ user_version: number }>(copy, 'PRAGMA user_version')?.user_version, CURRENT_SCHEMA_VERSION);
         assert.deepEqual(dbStats(copy).tables, sourceStats.tables);
         assert.equal(get<{ n: number }>(copy, 'SELECT count(*) AS n FROM req')?.n, 25);
         assert.equal(

@@ -19,11 +19,13 @@ import {
   fetchGreenhouse,
   fetchLever,
   parseCompRange,
+  probeAts,
+  type BlockedPlatforms,
 } from '../../src/main/sources/ats.js';
 
-import greenhouseFixture from '../fixtures/greenhouse.json';
-import ashbyFixture from '../fixtures/ashby.json';
-import leverFixture from '../fixtures/lever.json';
+import greenhouseFixture from '../fixtures/greenhouse.json' with { type: 'json' };
+import ashbyFixture from '../fixtures/ashby.json' with { type: 'json' };
+import leverFixture from '../fixtures/lever.json' with { type: 'json' };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Harness
@@ -492,4 +494,110 @@ test('PROBE_ORDER leads with the measured highest-hit-rate platform and has no d
   assert.equal(PROBE_ORDER[1], 'greenhouse');
   assert.equal(new Set(PROBE_ORDER).size, PROBE_ORDER.length);
   assert.ok(!PROBE_ORDER.includes('workday' as never), 'workday needs a tenant+site, not a token');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// probeAts — token-collision guard and per-platform blocking
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Like `serving`, but routed per URL — probeAts talks to several hosts. */
+async function servingRoutes<T>(
+  route: (url: string) => Response | Promise<Response>,
+  run: (requested: string[]) => Promise<T>,
+): Promise<T> {
+  const real = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = String(input);
+    requested.push(url);
+    return route(url);
+  }) as unknown as typeof globalThis.fetch;
+  try {
+    return await run(requested);
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+test('probeAts rejects a guessed token whose board names an obviously different company', async () => {
+  // 'atlas' is exactly the kind of generic token that attaches someone else's
+  // board. Workable's payload names its owner, so the collision is catchable.
+  const workablePayload = {
+    name: 'Atlas Industrial Holdings',
+    jobs: [{ shortcode: 'a1', title: 'Forklift Operator', url: 'https://atlas.example/jobs/a1' }],
+  };
+  const route = (url: string) =>
+    url.includes('apply.workable.com')
+      ? new Response(JSON.stringify(workablePayload), { status: 200 })
+      : new Response('not found', { status: 404 });
+
+  await servingRoutes(route, async () => {
+    const board = await probeAts('atlas', new Set(), { name: 'Zenith Grid', domain: 'zenithgrid.io' });
+    assert.equal(board, null, 'an unrelated company’s board must not attach');
+  });
+
+  // Without an expectation the same probe keeps its historical behaviour.
+  await servingRoutes(route, async () => {
+    const board = await probeAts('atlas', new Set());
+    assert.equal(board?.platform, 'workable');
+    assert.equal(board?.jobs.length, 1);
+  });
+});
+
+test('probeAts accepts a board whose payload matches the expected company', async () => {
+  const workablePayload = {
+    name: 'Zenith Grid Inc',
+    jobs: [{ shortcode: 'z1', title: 'Backend Engineer', url: 'https://zenithgrid.io/jobs/z1' }],
+  };
+  await servingRoutes(
+    (url) =>
+      url.includes('apply.workable.com')
+        ? new Response(JSON.stringify(workablePayload), { status: 200 })
+        : new Response('not found', { status: 404 }),
+    async () => {
+      const board = await probeAts('zenith', new Set(), { name: 'Zenith Grid', domain: 'zenithgrid.io' });
+      assert.equal(board?.platform, 'workable');
+      assert.equal(board?.jobs.length, 1);
+    },
+  );
+});
+
+test('probeAts passes the guard when the payload exposes no company name', async () => {
+  // Greenhouse /jobs payloads carry no owner name. Rejecting on absence would
+  // silently lose real boards, so no signal means accept.
+  const ghPayload = { jobs: [{ id: 9, title: 'Engineer', absolute_url: 'https://x.example/9' }] };
+  await servingRoutes(
+    (url) =>
+      url.includes('boards-api.greenhouse.io')
+        ? new Response(JSON.stringify(ghPayload), { status: 200 })
+        : new Response('not found', { status: 404 }),
+    async () => {
+      const board = await probeAts('atlas', new Set(), { name: 'Zenith Grid', domain: 'zenithgrid.io' });
+      assert.equal(board?.platform, 'greenhouse', 'no name signal means no basis to reject');
+    },
+  );
+});
+
+test('probeAts keeps a partially-fetched SmartRecruiters board but marks the platform blocked on a page-2 429', async () => {
+  const page1 = {
+    content: Array.from({ length: 100 }, (_, i) => ({ id: `p${i}`, name: `Role ${i}` })),
+    totalFound: 150,
+  };
+  const blocked: BlockedPlatforms = new Set();
+  await servingRoutes(
+    (url) => {
+      if (url.includes('api.smartrecruiters.com')) {
+        return url.endsWith('offset=0')
+          ? new Response(JSON.stringify(page1), { status: 200 })
+          : new Response('rate limited', { status: 429 });
+      }
+      return new Response('not found', { status: 404 });
+    },
+    async () => {
+      const board = await probeAts('megacorp', blocked);
+      assert.equal(board?.platform, 'smartrecruiters');
+      assert.equal(board?.jobs.length, 100, 'page 1 postings are real data and must be kept');
+      assert.ok(blocked.has('smartrecruiters'), 'the platform must still be marked blocked for the rest of the run');
+    },
+  );
 });

@@ -33,8 +33,8 @@ const EXPECTED_CHANNELS = [
   'listCompanies', 'getCompany', 'patchCompany', 'bulkCompanyStatus', 'resolveConflict',
   'patchContact', 'addContact', 'deleteContact', 'findContacts', 'verifyContact',
   'getPipeline', 'runSource', 'runAll', 'stopPipeline', 'setSourceEnabled',
-  'listDrafts', 'generateDraft', 'patchDraft', 'queueDraft', 'skipDraft', 'sendNow',
-  'getSendStats', 'startSending', 'pauseSending', 'listInbound', 'markInbound', 'syncInbox',
+  'listDrafts', 'generateDraft', 'patchDraft', 'queueDraft', 'unqueueDraft', 'skipDraft', 'sendNow', 'sendTestEmail',
+  'getSendStats', 'startSending', 'pauseSending', 'listInbound', 'markInbound', 'syncInbox', 'listSent', 'getPerformance', 'generateFollowUp',
   'getSettings', 'patchSettings', 'setSecret', 'testKey', 'connectGmail', 'disconnectGmail', 'testGmail',
   'getLinkedInStatus', 'connectLinkedIn', 'disconnectLinkedIn',
   'listSuppressions', 'addSuppression', 'removeSuppression', 'importSuppressionsCsv',
@@ -280,7 +280,9 @@ test("perDay above 500 is rejected — Gmail's hard ceiling", () => {
 test('sending bounds: perHour, jitterPct and the send window', () => {
   bad('patchSettings', [{ sending: { perHour: 0 } }], 'perHour must be at least 1');
   bad('patchSettings', [{ sending: { perHour: 201 } }], 'perHour cannot exceed 200');
-  bad('patchSettings', [{ sending: { jitterPct: 101 } }], 'jitterPct cannot exceed 100');
+  // 90 matches the read-side clamp in src/main/settings.ts — the schema and
+  // the clamp must agree or accepted values get silently rewritten on read.
+  bad('patchSettings', [{ sending: { jitterPct: 91 } }], 'jitterPct cannot exceed 90');
   bad('patchSettings', [{ sending: { jitterPct: -1 } }], 'jitterPct cannot be negative');
   bad('patchSettings', [{ sending: { windowStart: '9am' } }], '24-hour HH:MM');
   bad('patchSettings', [{ sending: { windowEnd: '24:00' } }], '24-hour HH:MM');
@@ -360,10 +362,12 @@ test('listDrafts takes an optional draft state from the CHECK list', () => {
   bad('listDrafts', ['pending'], 'arg0');
 });
 
-test('generateDraft takes a company id and an optional contact id', () => {
-  assert.deepEqual(ok('generateDraft', [ID]), [ID, undefined]);
+test('generateDraft takes a company id, optional contact id, optional force', () => {
+  assert.deepEqual(ok('generateDraft', [ID]), [ID, undefined, undefined]);
   ok('generateDraft', [ID, ID]);
+  ok('generateDraft', [ID, ID, true]);
   bad('generateDraft', [ID, ''], 'arg1');
+  bad('generateDraft', [ID, ID, 'yes'], 'arg2');
 });
 
 test('patchDraft only accepts subject and body', () => {

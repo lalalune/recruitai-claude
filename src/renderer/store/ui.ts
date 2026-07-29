@@ -1,9 +1,17 @@
 import { create } from 'zustand';
 
 import type { CompanyFilter } from '../../shared/ipc.js';
-import { readJson, writeJson } from '../lib/utils.js';
+import { getTheme, readJson, setTheme, writeJson, type Theme } from '../lib/utils.js';
 
 export type Screen = 'review' | 'outreach' | 'pipeline' | 'settings' | 'setup';
+
+export const OUTREACH_TABS = ['drafts', 'queue', 'sent', 'replies'] as const;
+export type OutreachTab = (typeof OUTREACH_TABS)[number];
+
+/** A persisted tab that is no longer in the enum falls back to a real one. */
+export function normalizeOutreachTab(v: string | null | undefined): OutreachTab {
+  return (OUTREACH_TABS as readonly string[]).includes(v ?? '') ? (v as OutreachTab) : 'drafts';
+}
 
 export type SortKey = 'score' | 'reqs' | 'days_open' | 'fee' | 'recent' | 'name';
 
@@ -103,13 +111,23 @@ interface UiState {
   selectedId: string | null;
   setSelectedId: (id: string | null) => void;
 
-  /** Multi-select for bulk actions. Anchor supports shift+click ranges. */
+  /**
+   * Multi-select for bulk actions. The anchor is where a shift+click range
+   * starts: a plain click or keyboard selection move sets it, a cmd+click
+   * toggle sets it, and shift+click ranges FROM it without moving it — so
+   * repeated shift+clicks all extend from the same origin.
+   */
   marked: string[];
   anchorIndex: number | null;
   setMarked: (ids: string[]) => void;
+  setAnchorIndex: (index: number | null) => void;
   toggleMarked: (id: string, index: number) => void;
-  markRange: (ids: string[], index: number) => void;
+  markRange: (ids: string[]) => void;
   clearMarked: () => void;
+
+  /** Theme choice — the single source of truth the sidebar, palette and Toaster read. */
+  theme: Theme;
+  setThemeChoice: (t: Theme) => void;
 
   // Global overlays
   paletteOpen: boolean;
@@ -167,18 +185,27 @@ export const useUi = create<UiState>((set, get) => ({
   marked: [],
   anchorIndex: null,
   setMarked: (marked) => set({ marked }),
+  setAnchorIndex: (anchorIndex) => set({ anchorIndex }),
   toggleMarked: (id, index) =>
     set((s) => ({
       marked: s.marked.includes(id) ? s.marked.filter((m) => m !== id) : [...s.marked, id],
       anchorIndex: index,
     })),
-  markRange: (ids, index) =>
+  // Merging without touching the anchor is what lets a second shift+click
+  // widen or re-aim the range from the same origin.
+  markRange: (ids) =>
     set((s) => {
       const merged = new Set(s.marked);
       for (const id of ids) merged.add(id);
-      return { marked: [...merged], anchorIndex: index };
+      return { marked: [...merged] };
     }),
   clearMarked: () => set({ marked: [], anchorIndex: null }),
+
+  theme: getTheme(),
+  setThemeChoice: (theme) => {
+    setTheme(theme);
+    set({ theme });
+  },
 
   paletteOpen: false,
   setPaletteOpen: (paletteOpen) => set({ paletteOpen }),

@@ -16,6 +16,7 @@ import {
   extractUrls,
   filterYcIcp,
   isBayArea,
+  listWhoIsHiringThreads,
   type YcCompany,
 } from '../../src/main/sources/seeds.js';
 
@@ -282,4 +283,65 @@ test('extractUrls trims trailing punctuation and dedupes', () => {
 test('extractUrls ignores bare domains and returns an empty list when there are none', () => {
   assert.deepEqual(extractUrls('visit acme.com'), []);
   assert.deepEqual(extractUrls(''), []);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listWhoIsHiringThreads — the window arithmetic behind "Twelve months of threads"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Serves one JSON payload for every request and captures the URLs asked for. */
+async function servingHits<T>(payload: unknown, run: (requested: string[]) => Promise<T>): Promise<T> {
+  const real = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    requested.push(String(input));
+    return new Response(JSON.stringify(payload), { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+  try {
+    return await run(requested);
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+test('listWhoIsHiringThreads asks for three stories per month plus margin, not two', async () => {
+  // whoishiring posts THREE stories a month ("Who is hiring?", "Who wants to
+  // be hired?", "Freelancer?"), so hitsPerPage=limit*2 starved a 12-month
+  // window down to ~8 hiring threads. This models exactly that feed.
+  const monthName = (i: number) => `Month ${Math.floor(i / 3)}`;
+  const hits = Array.from({ length: 42 }, (_, i) => {
+    const kind = i % 3;
+    const title =
+      kind === 0
+        ? `Ask HN: Who is hiring? (${monthName(i)})`
+        : kind === 1
+          ? `Ask HN: Who wants to be hired? (${monthName(i)})`
+          : `Ask HN: Freelancer? Seeking freelancer? (${monthName(i)})`;
+    return { objectID: String(1000 + i), title, created_at: '2026-07-01T12:00:00Z', num_comments: 100 };
+  });
+
+  await servingHits({ hits }, async (requested) => {
+    const threads = await listWhoIsHiringThreads(12);
+    assert.match(requested[0]!, /hitsPerPage=42\b/, '12 months needs 12*3+6 stories fetched');
+    assert.equal(threads.length, 12, 'a full year of monthly hiring threads must survive the filter');
+    for (const t of threads) assert.match(t.title, /who is hiring/i);
+  });
+});
+
+test('listWhoIsHiringThreads keeps the hiring filter and the cap for small windows', async () => {
+  const hits = [
+    { objectID: '1', title: 'Ask HN: Who is hiring? (July 2026)', created_at: '2026-07-01', num_comments: 300 },
+    { objectID: '2', title: 'Ask HN: Who wants to be hired? (July 2026)', created_at: '2026-07-01', num_comments: 90 },
+    { objectID: '3', title: 'Ask HN: Who is hiring? (June 2026)', created_at: '2026-06-01', num_comments: 280 },
+    { objectID: '4', title: 'Ask HN: Who is hiring? (May 2026)', created_at: '2026-05-01', num_comments: 250 },
+  ];
+  await servingHits({ hits }, async (requested) => {
+    const threads = await listWhoIsHiringThreads(2);
+    assert.match(requested[0]!, /hitsPerPage=12\b/);
+    assert.deepEqual(
+      threads.map((t) => t.objectID),
+      ['1', '3'],
+      'non-hiring threads are filtered out first, then the limit applies',
+    );
+  });
 });

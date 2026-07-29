@@ -21,6 +21,17 @@ import type {
   SuppressionRow,
   LinkedInStatus,
 } from '../../shared/ipc.js';
+import {
+  assembleEmail,
+  BAND_LABELS,
+  DEFAULT_OPT_OUT_LINE,
+  HEADCOUNT_BANDS,
+  renderTemplate,
+  TEMPLATE_VARIABLES,
+  unknownTemplateVariables,
+  type HeadcountBand,
+  type TemplateVars,
+} from '../../shared/outreach.js';
 import { DEFAULT_ICP } from '../../shared/score.js';
 import {
   api,
@@ -50,7 +61,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '../components/ui/dialog.js';
-import { resolveVariables, VARIABLE_KEYS } from '../components/EmailComposer.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared settings data access — Outreach and Setup reuse these.
@@ -69,6 +79,7 @@ function mergeSettings(prev: SettingsShape, patch: SettingsPatch): SettingsShape
     sending: { ...prev.sending, ...(patch.sending ?? {}) },
     crawl: { ...prev.crawl, ...(patch.crawl ?? {}) },
     spendCapUsd: patch.spendCapUsd ?? prev.spendCapUsd,
+    templates: { ...prev.templates, ...(patch.templates ?? {}) },
   };
 }
 
@@ -92,42 +103,30 @@ export function useSettingsPatch() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Templates. The IPC Settings shape has no template field, so these live in
-// renderer storage and are read back by the composer; nothing else depends on
-// them being on the main side.
+// Templates render from src/shared/outreach.ts — the same code the generator
+// and sender run — and persist in Settings via patchSettings({ templates }).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const TEMPLATE_BANDS = [
-  { key: 'lt20', label: 'Under 20 people', hint: 'Founder decides directly' },
-  { key: 'band20_75', label: '20–75 people', hint: 'Founder or VP Eng; TA may be a blocker' },
-  { key: 'band75_300', label: '75–300 people', hint: 'Head of Talent owns the vendor list' },
-  { key: 'gt300', label: '300+ people', hint: 'Expect procurement or a PSL' },
-] as const;
+const BAND_HINTS: Record<HeadcountBand, string> = {
+  under_20: 'Founder decides directly',
+  '20_75': 'Founder or VP Eng; TA may be a blocker',
+  '75_300': 'Head of Talent owns the vendor list',
+  over_300: 'Expect procurement or a PSL',
+};
 
-export type TemplateBand = (typeof TEMPLATE_BANDS)[number]['key'];
-
-const TEMPLATE_STORE = 'recruitai.templates.v1';
-
-export function readTemplates(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem(TEMPLATE_STORE);
-    return raw ? (JSON.parse(raw) as Record<string, string>) : {};
-  } catch {
-    return {};
-  }
-}
-
-function writeTemplates(next: Record<string, string>) {
-  localStorage.setItem(TEMPLATE_STORE, JSON.stringify(next));
-}
-
-export const DEFAULT_OPT_OUT_LINE = 'If this is not useful, reply "stop" and I will not contact you again.';
-
-const PREVIEW_VARS = {
-  first_name: 'Dana',
-  req_title: 'Senior Backend Engineer',
-  days_open: '62',
-  company: 'Ramp',
+/** Plausible values so the live preview reads like a real message. */
+const PREVIEW_VARS: TemplateVars = {
+  firstName: 'Dana',
+  companyName: 'Ramp',
+  reqTitle: 'Senior Backend Engineer',
+  reqDaysOpen: 62,
+  reqLocation: 'San Francisco',
+  openReqCount: 7,
+  openEngCount: 4,
+  staleReqCount: 2,
+  fee: '$36,000',
+  fundingStage: 'Series B',
+  ycBatch: 'W21',
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,7 +155,8 @@ function Row({
   );
 }
 
-function NumberInput({
+/** Commit-on-blur numeric input. Exported: Outreach's pacing panel reuses it. */
+export function NumberInput({
   value,
   onCommit,
   min,
@@ -673,7 +673,7 @@ export function Settings() {
                 <NumberInput
                   value={settings.sending.perHour}
                   min={1}
-                  max={100}
+                  max={200}
                   onCommit={(perHour) => patch.mutate({ sending: { perHour } })}
                 />
               </Row>
@@ -893,10 +893,11 @@ function TemplatesPanel({ settings }: { settings: SettingsShape }) {
       }),
     onError: (e: Error) => toast.error('Could not start draft generation', { description: e.message }),
   });
-  const [templates, setTemplates] = useState<Record<string, string>>(() => readTemplates());
-  const [band, setBand] = useState<TemplateBand>('band20_75');
+  const [band, setBand] = useState<HeadcountBand>('20_75');
   const [signature, setSignature] = useState(settings.sending.signature);
   const sigRef = useRef(settings.sending.signature);
+  const [postal, setPostal] = useState(settings.sending.postalAddress ?? '');
+  const postalRef = useRef(settings.sending.postalAddress ?? '');
 
   useEffect(() => {
     if (settings.sending.signature !== sigRef.current) {
@@ -905,60 +906,49 @@ function TemplatesPanel({ settings }: { settings: SettingsShape }) {
     }
   }, [settings.sending.signature]);
 
-  const setTemplate = (value: string) => {
-    const next = { ...templates, [band]: value };
-    setTemplates(next);
-    writeTemplates(next);
-  };
+  useEffect(() => {
+    const next = settings.sending.postalAddress ?? '';
+    if (next !== postalRef.current) {
+      postalRef.current = next;
+      setPostal(next);
+    }
+  }, [settings.sending.postalAddress]);
 
-  const current = templates[band] ?? '';
-  const optOut = settings.sending.includeOptOutLine;
-  const preview = useMemo(() => {
-    const parts = [resolveVariables(current, PREVIEW_VARS), signature || null];
-    if (optOut) parts.push(DEFAULT_OPT_OUT_LINE);
-    return parts.filter(Boolean).join('\n\n');
-  }, [current, signature, optOut]);
+  const templates = settings.templates;
+  const isBuiltIn = (b: HeadcountBand) =>
+    !(templates?.[b]?.subject?.trim() || templates?.[b]?.body?.trim());
 
   return (
     <div className="space-y-4 py-1">
       <div className="flex flex-wrap gap-1.5">
-        {TEMPLATE_BANDS.map((b) => (
+        {HEADCOUNT_BANDS.map((b) => (
           <button
-            key={b.key}
+            key={b}
             type="button"
-            onClick={() => setBand(b.key)}
+            onClick={() => setBand(b)}
             className={cn(
               'rounded-md border px-2.5 py-1 text-xs transition-colors',
-              band === b.key
+              band === b
                 ? 'border-primary bg-primary/10 text-primary'
                 : 'border-border text-muted-foreground hover:bg-muted',
             )}
           >
-            {b.label}
+            {BAND_LABELS[b]}
+            {isBuiltIn(b) && <span className="ml-1.5 opacity-60">built-in</span>}
           </button>
         ))}
       </div>
 
-      <div className="text-xs text-muted-foreground">
-        {TEMPLATE_BANDS.find((b) => b.key === band)?.hint} · Variables:{' '}
-        {VARIABLE_KEYS.map((v) => `{{${v}}}`).join(' ')}
-      </div>
-
-      <div className="grid grid-cols-2 gap-4">
-        <Textarea
-          value={current}
-          onChange={(e) => setTemplate(e.target.value)}
-          spellCheck
-          className="min-h-56 font-sans text-[13px] leading-[1.6]"
-          placeholder={`Hi {{first_name}},\n\nI noticed {{company}} has had {{req_title}} open for {{days_open}} days…`}
-        />
-        <div className="min-h-56 whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-3 text-[13px] leading-[1.6]">
-          {preview || <span className="text-muted-foreground">Live preview appears here.</span>}
-        </div>
-      </div>
+      <BandTemplateEditor
+        key={band}
+        band={band}
+        value={templates?.[band] ?? { subject: '', body: '' }}
+        settings={settings}
+        onSave={(subject, body) => patch.mutate({ templates: { [band]: { subject, body } } })}
+      />
 
       <div className="divide-y divide-border">
-        <Row label="Signature" help="Appended to every send, below the body.">
+        <Row label="Signature" help="Baked into every draft at generation time, below the body.">
           <Textarea
             value={signature}
             className="h-20 w-80 text-sm"
@@ -967,6 +957,23 @@ function TemplatesPanel({ settings }: { settings: SettingsShape }) {
               if (signature !== sigRef.current) {
                 sigRef.current = signature;
                 patch.mutate({ sending: { signature } });
+              }
+            }}
+          />
+        </Row>
+        <Row
+          label="Postal address"
+          help="CAN-SPAM requires a valid physical postal address in every commercial email. It is appended to every message — the sender re-adds it if an edit removed it."
+        >
+          <Textarea
+            value={postal}
+            placeholder={'123 Market St, Suite 400\nSan Francisco, CA 94105'}
+            className="h-20 w-80 text-sm"
+            onChange={(e) => setPostal(e.target.value)}
+            onBlur={() => {
+              if (postal !== postalRef.current) {
+                postalRef.current = postal;
+                patch.mutate({ sending: { postalAddress: postal } });
               }
             }}
           />
@@ -982,7 +989,7 @@ function TemplatesPanel({ settings }: { settings: SettingsShape }) {
         </Row>
         <Row
           label="Generate drafts for approved companies"
-          help="Drafts are written by the draft generation pipeline step — approving a company in Review does not start one. Run this once you have a batch of approvals waiting; every approved company with a contact gets a draft you can still edit before it queues."
+          help="Approving a company in Review already queues its first draft automatically. Run this to backfill a draft for any approved company that does not have one yet — each gets a draft you can still edit before it queues."
         >
           <Button
             variant="outline"
@@ -994,6 +1001,138 @@ function TemplatesPanel({ settings }: { settings: SettingsShape }) {
             {generateDrafts.isPending ? 'Starting…' : 'Generate drafts'}
           </Button>
         </Row>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Buffered editor for one band. Remounted per band (key) so local state always
+ * initialises from the stored template; edits commit on blur.
+ */
+function BandTemplateEditor({
+  band,
+  value,
+  settings,
+  onSave,
+}: {
+  band: HeadcountBand;
+  value: { subject: string; body: string };
+  settings: SettingsShape;
+  onSave(subject: string, body: string): void;
+}) {
+  const [subject, setSubject] = useState(value.subject);
+  const [body, setBody] = useState(value.body);
+  const bodyRef = useRef<HTMLTextAreaElement | null>(null);
+  const savedRef = useRef(value);
+
+  const commit = () => {
+    if (subject !== savedRef.current.subject || body !== savedRef.current.body) {
+      savedRef.current = { subject, body };
+      onSave(subject, body);
+    }
+  };
+
+  const insertVariable = (name: string) => {
+    const token = `{${name}}`;
+    const el = bodyRef.current;
+    if (!el) {
+      setBody((b) => `${b}${token}`);
+      return;
+    }
+    const start = el.selectionStart ?? body.length;
+    const end = el.selectionEnd ?? start;
+    setBody(`${body.slice(0, start)}${token}${body.slice(end)}`);
+    requestAnimationFrame(() => {
+      el.focus();
+      const caret = start + token.length;
+      el.setSelectionRange(caret, caret);
+    });
+  };
+
+  const unknown = useMemo(
+    () => unknownTemplateVariables(`${subject}\n${body}`),
+    [subject, body],
+  );
+
+  // The preview runs the exact shared pipeline the generator runs: render the
+  // template, then assemble the compliance footer.
+  const previewSubject = renderTemplate(subject, PREVIEW_VARS);
+  const previewBody = body.trim()
+    ? assembleEmail(renderTemplate(body, PREVIEW_VARS), {
+        includeOptOutLine: settings.sending.includeOptOutLine,
+        signature: settings.sending.signature ?? '',
+        postalAddress: settings.sending.postalAddress ?? '',
+      })
+    : '';
+
+  return (
+    <div className="space-y-3">
+      <div className="text-xs text-muted-foreground">
+        {BAND_HINTS[band]} · Leave subject and body empty to use the built-in template for this
+        band.
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="mr-1 text-xs text-muted-foreground">Insert</span>
+        {TEMPLATE_VARIABLES.map((v) => (
+          <button
+            key={v}
+            type="button"
+            onClick={() => insertVariable(v)}
+            className="rounded-full border border-border bg-muted/60 px-2 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary"
+            title="A line whose variable has no value for a record is dropped whole."
+          >
+            {`{${v}}`}
+          </button>
+        ))}
+      </div>
+
+      {unknown.length > 0 && (
+        <div className="flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            Unknown variable{unknown.length === 1 ? '' : 's'}:{' '}
+            {unknown.map((u) => `{${u}}`).join(', ')} — lines containing them will be dropped from
+            every message.
+          </span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Input
+            value={subject}
+            onChange={(e) => setSubject(e.target.value)}
+            onBlur={commit}
+            spellCheck
+            className="h-8 text-sm"
+            placeholder="Subject — empty uses the built-in"
+          />
+          <Textarea
+            ref={bodyRef}
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            onBlur={commit}
+            spellCheck
+            className="min-h-56 font-sans text-[13px] leading-[1.6]"
+            placeholder={`Hi {firstName},\n\nI noticed {companyName} has had {reqTitle} open for {reqDaysOpen} days…\n\nEmpty uses the built-in body.`}
+          />
+        </div>
+        <div className="min-h-56 rounded-md border border-border bg-muted/30 p-3 text-[13px] leading-[1.6]">
+          {body.trim() ? (
+            <>
+              {previewSubject && (
+                <div className="mb-2 border-b border-border pb-2 font-medium">{previewSubject}</div>
+              )}
+              <div className="whitespace-pre-wrap">{previewBody}</div>
+            </>
+          ) : (
+            <span className="text-muted-foreground">
+              Using the built-in template for this band — write a body on the left to override it.
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1179,23 +1318,12 @@ function DataPanel({ settings }: { settings: SettingsShape }) {
 
   const exportCsv = useMutation({
     mutationFn: (what: 'companies' | 'contacts' | 'drafts') => api.exportCsv(what),
-    onSuccess: (result, what) => {
-      // exportCsv returns either a written path or the CSV body itself; a body
-      // is saved locally rather than dropped on the floor.
-      if (result.includes('\n')) {
-        const url = URL.createObjectURL(new Blob([result], { type: 'text/csv' }));
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${what}-${new Date().toISOString().slice(0, 10)}.csv`;
-        a.click();
-        URL.revokeObjectURL(url);
-        toast.success(`Exported ${what}`);
-      } else {
-        toast.success(`Exported ${what}`, {
-          description: result,
-          action: { label: 'Open folder', onClick: () => void api.openDataDir() },
-        });
-      }
+    // exportCsv always writes a file and returns its path.
+    onSuccess: (path, what) => {
+      toast.success(`Exported ${what}`, {
+        description: path,
+        action: { label: 'Open folder', onClick: () => void api.openDataDir() },
+      });
     },
     onError: (e: Error) => toast.error('Export failed', { description: e.message }),
   });

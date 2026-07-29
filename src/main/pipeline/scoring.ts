@@ -424,7 +424,9 @@ export async function scoreAll(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
 
   const qualified = get<{ n: number }>(
     db,
-    'SELECT count(*) AS n FROM company WHERE disqualified IS NULL AND quality_score >= 6',
+    // canonical_id IS NULL: merged-away duplicates keep their last score and
+    // would otherwise inflate this tally.
+    'SELECT count(*) AS n FROM company WHERE canonical_id IS NULL AND disqualified IS NULL AND quality_score >= 6',
   );
   return {
     records: done,

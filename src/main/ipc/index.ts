@@ -11,6 +11,7 @@ import { getDb } from '../db/index.js';
 import { dataDir } from '../index.js';
 import { setDataDir } from '../settings.js';
 import { setPipelineWindow, recoverAfterRestart, appendLog } from '../pipeline/run.js';
+import { setGmailEventSink } from '../gmail/oauth.js';
 import { registerCompanyIpc } from './companies.js';
 import { registerPipelineIpc } from './pipeline.js';
 import { registerOutreachIpc, reconcileInterruptedSends, pauseSending } from './outreach.js';
@@ -22,22 +23,51 @@ const CHANNELS = [
   'listCompanies', 'getCompany', 'patchCompany', 'bulkCompanyStatus', 'resolveConflict',
   'patchContact', 'addContact', 'deleteContact', 'findContacts', 'verifyContact',
   'getPipeline', 'runSource', 'runAll', 'stopPipeline', 'setSourceEnabled',
-  'listDrafts', 'generateDraft', 'patchDraft', 'queueDraft', 'skipDraft', 'sendNow',
-  'getSendStats', 'startSending', 'pauseSending', 'listInbound', 'markInbound', 'syncInbox',
+  'listDrafts', 'generateDraft', 'patchDraft', 'queueDraft', 'unqueueDraft', 'skipDraft', 'sendNow', 'sendTestEmail',
+  'getSendStats', 'startSending', 'pauseSending', 'listInbound', 'markInbound', 'syncInbox', 'listSent', 'getPerformance', 'generateFollowUp',
   'getLinkedInStatus', 'connectLinkedIn', 'disconnectLinkedIn',
   'getSettings', 'patchSettings', 'setSecret', 'testKey', 'connectGmail', 'disconnectGmail', 'testGmail',
   'listSuppressions', 'addSuppression', 'removeSuppression', 'importSuppressionsCsv',
   'getStats', 'exportCsv', 'backupNow', 'openDataDir', 'openExternal', 'getScreenshot',
 ] as const;
 
-let registered = false;
+/** Windows already carrying the closed-hook — the dev watcher re-enters
+ *  registerIpc and stacked a duplicate pause/unwire listener per reload. */
+const wiredWindows = new WeakSet<BrowserWindow>();
+
+let bootstrapped = false;
+
+/**
+ * Point progress/log events at a window and pause sending when it closes.
+ * Called for every window we create — including macOS dock re-activation,
+ * which builds a new BrowserWindow long after registerIpc ran.
+ */
+export function wireWindow(win: BrowserWindow): void {
+  setPipelineWindow(win);
+  // Gmail events (needs-reauth) go to this window only — the fallback
+  // broadcast would also reach the LinkedIn login/worker windows.
+  setGmailEventSink((channel, payload) => {
+    if (!win.isDestroyed()) win.webContents.send(channel, payload);
+  });
+  if (wiredWindows.has(win)) return;
+  wiredWindows.add(win);
+  win.on('closed', () => {
+    try {
+      pauseSending(getDb());
+    } catch {
+      /* quitting: before-quit already paused and closed the db */
+    }
+    setPipelineWindow(null);
+    setGmailEventSink(null);
+  });
+}
 
 export function registerIpc(win: BrowserWindow): void {
   // The dev watcher can re-enter this; ipcMain.handle throws on a duplicate.
   for (const channel of CHANNELS) ipcMain.removeHandler(channel);
 
   setDataDir(dataDir());
-  setPipelineWindow(win);
+  wireWindow(win);
 
   registerCompanyIpc();
   registerPipelineIpc();
@@ -45,13 +75,10 @@ export function registerIpc(win: BrowserWindow): void {
   registerLinkedInIpc();
   registerSettingsIpc();
 
-  if (!registered) {
-    registered = true;
-    win.on('closed', () => {
-      pauseSending(getDb());
-      setPipelineWindow(null);
-    });
-  }
+  // Once per process. The dev watcher re-enters registerIpc; reconciling again
+  // mid-session would mark a genuinely in-flight send as failed.
+  if (bootstrapped) return;
+  bootstrapped = true;
 
   recoverAfterRestart();
 

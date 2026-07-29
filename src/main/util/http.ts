@@ -3,10 +3,13 @@
  *
  * Two rules encoded here, both deliberate:
  *
- *  1. On 429/403 we back off and ultimately stop. We do not rotate proxies or
- *     otherwise work around a deliberate block. Reading public data briskly is
- *     defensible; circumventing a block is a different thing and would turn an
- *     operational annoyance into a legal argument.
+ *  1. On 429/403 we stop. The one exception is a 429 carrying a small
+ *     Retry-After (≤30s): that is the host telling us how to be polite, so we
+ *     wait exactly that long and try once more while retries remain. A 403, a
+ *     bare 429, or a long Retry-After is terminal for the source. We never
+ *     rotate proxies or otherwise work around a deliberate block. Reading
+ *     public data briskly is defensible; circumventing a block is a different
+ *     thing and would turn an operational annoyance into a legal argument.
  *
  *  2. The User-Agent is truthful and carries a contact URL, so anyone who
  *     notices the traffic can reach us.
@@ -57,6 +60,31 @@ function backoffMs(attempt: number): number {
   return Math.floor(Math.random() * base);
 }
 
+/** The longest Retry-After we will honour. Beyond this the host is effectively
+ *  saying "come back much later", which for a single sweep means: stop. */
+const RETRY_AFTER_MAX_S = 30;
+
+/**
+ * A Retry-After we are willing to honour: a plain non-negative number of
+ * seconds, no larger than RETRY_AFTER_MAX_S. The HTTP-date form (and anything
+ * longer than the cap) reads as a long ban and yields null — terminal.
+ */
+function politeRetryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const t = header.trim();
+  // Number('') is 0 — an empty header would otherwise read as "retry now".
+  if (!t) return null;
+  const s = Number(t);
+  if (!Number.isFinite(s) || s < 0 || s > RETRY_AFTER_MAX_S) return null;
+  return Math.round(s * 1000);
+}
+
+/** Release the connection on paths that never read the body. An abandoned
+ *  undici body pins its pooled connection until GC gets around to it. */
+function discardBody(res: Response): void {
+  void res.body?.cancel().catch(() => {});
+}
+
 export async function httpRequest(
   url: string,
   opts: HttpOptions = {},
@@ -74,6 +102,9 @@ export async function httpRequest(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const controller = new AbortController();
+    // The timer covers the WHOLE attempt, headers and body. Clearing it when
+    // headers arrived (as this once did) let a slow-dripping body hold a
+    // worker far past timeoutMs.
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
@@ -84,12 +115,20 @@ export async function httpRequest(
         signal: controller.signal,
         redirect: 'follow',
       });
-      clearTimeout(timer);
 
       const fetchedAt = new Date().toISOString();
 
-      // Terminal: the host is telling us to stop. Do not retry, do not evade.
       if (res.status === 429 || res.status === 403) {
+        discardBody(res);
+        // A 429 with a small Retry-After is a pacing instruction, not a ban —
+        // honouring it is the polite move. Everything else in this branch is
+        // the host telling us to stop: do not retry, do not evade.
+        const waitMs = res.status === 429 ? politeRetryAfterMs(res.headers.get('retry-after')) : null;
+        if (waitMs != null && attempt < maxRetries) {
+          lastError = `HTTP ${res.status}`;
+          await sleep(waitMs);
+          continue;
+        }
         return {
           ok: false,
           status: res.status,
@@ -103,20 +142,22 @@ export async function httpRequest(
 
       // Transient server-side: worth one more try.
       if (res.status >= 500 && attempt < maxRetries) {
+        discardBody(res);
         lastError = `HTTP ${res.status}`;
         await sleep(backoffMs(attempt));
         continue;
       }
 
-      const text = await readCapped(res, maxBytes);
+      const text = await readCapped(res, maxBytes, controller.signal);
       return { ok: res.ok, status: res.status, body: text, url, fetchedAt };
     } catch (err) {
-      clearTimeout(timer);
       lastError = err instanceof Error ? err.message : String(err);
       if (attempt < maxRetries) {
         await sleep(backoffMs(attempt));
         continue;
       }
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -130,29 +171,48 @@ export async function httpRequest(
   };
 }
 
-async function readCapped(res: Response, maxBytes: number): Promise<string> {
+async function readCapped(res: Response, maxBytes: number, signal?: AbortSignal): Promise<string> {
   const reader = res.body?.getReader();
   if (!reader) return res.text();
 
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.length;
-    if (total > maxBytes) {
-      reader.cancel();
-      throw new Error(`Response exceeded ${maxBytes} bytes`);
+  // The fetch signal does not reliably propagate into an in-flight body read,
+  // so each read is raced against it explicitly — this is what makes timeoutMs
+  // a bound on the whole attempt rather than just on the headers.
+  const aborted = signal
+    ? new Promise<never>((_, reject) => {
+        const bail = () => reject(new Error('Body read aborted: request timeout'));
+        if (signal.aborted) bail();
+        else signal.addEventListener('abort', bail, { once: true });
+      })
+    : null;
+
+  try {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = aborted
+        ? await Promise.race([reader.read(), aborted])
+        : await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxBytes) {
+        throw new Error(`Response exceeded ${maxBytes} bytes`);
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.length;
+    }
+    return new TextDecoder().decode(merged);
+  } catch (err) {
+    // Over-cap, timeout, or a mid-body transport failure: release the
+    // connection rather than leaving a half-read body pinning it.
+    void reader.cancel().catch(() => {});
+    throw err;
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.length;
-  }
-  return new TextDecoder().decode(merged);
 }
 
 export async function httpJson<T>(url: string, opts: HttpOptions = {}): Promise<T | null> {

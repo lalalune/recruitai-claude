@@ -46,7 +46,11 @@ export async function buildRawMessage(msg: OutboundMessage): Promise<string> {
     to: msg.to,
     replyTo: msg.replyTo,
     subject: msg.subject,
-    text: msg.body,
+    // RFC 5322 wants CRLF throughout. nodemailer's quoted-printable encoder
+    // folds long lines with CRLF soft breaks but passes the body's own bare
+    // LFs through untouched, which yields a mixed-EOL message — normalise
+    // before composing so the wire form is uniformly CRLF.
+    text: msg.body.replace(/\r\n|[\r\n]/g, '\r\n'),
     headers,
     inReplyTo: msg.inReplyTo,
     references: msg.references,
@@ -120,13 +124,19 @@ export function findPart(
   return parts.find((p) => (p.mimeType ?? '').toLowerCase() === want);
 }
 
-/** `multipart/report; report-type=delivery-status` → { type, params: {report-type: ...} } */
+/**
+ * `multipart/report; report-type=delivery-status` → { type, params: {report-type: ...} }.
+ *
+ * The parameter split is quote-aware because RFC 2045 quoted values may legally
+ * contain the delimiter — boundary="a;b" is real mail in the wild, and a naive
+ * split truncates the value and quietly breaks every lookup made against it.
+ */
 export function parseContentType(value: string | null): {
   type: string;
   params: Record<string, string>;
 } {
   if (!value) return { type: '', params: {} };
-  const segments = value.split(';');
+  const segments = splitOutsideQuotes(value, ';');
   const type = (segments.shift() ?? '').trim().toLowerCase();
   const params: Record<string, string> = {};
   for (const seg of segments) {
@@ -134,10 +144,28 @@ export function parseContentType(value: string | null): {
     if (eq === -1) continue;
     const key = seg.slice(0, eq).trim().toLowerCase();
     let val = seg.slice(eq + 1).trim();
-    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+    if (val.length >= 2 && val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
     params[key] = val;
   }
   return { type, params };
+}
+
+/** Split on `delim` wherever it falls outside a double-quoted string. */
+function splitOutsideQuotes(value: string, delim: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let quoted = false;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (quoted && ch === '\\') i++; // a quoted-pair may escape the closing quote
+    else if (ch === '"') quoted = !quoted;
+    else if (ch === delim && !quoted) {
+      out.push(value.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(value.slice(start));
+  return out;
 }
 
 /** `"Mail Delivery Subsystem" <mailer-daemon@googlemail.com>` → the address. */

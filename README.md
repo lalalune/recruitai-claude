@@ -16,13 +16,13 @@ Every one of those facts is available for free from public job-board APIs. recru
 
 ## What it does
 
-**Discovery is free.** Greenhouse, Ashby, Lever, SmartRecruiters, Workable and Workday all publish every customer's open roles as unauthenticated JSON. Combined with Y Combinator's open company directory and the monthly Hacker News "Who is hiring?" thread, that's a complete hiring-signal layer at zero cost and with no API keys. All of it was verified live before being built — see [VERIFIED-SOURCES.md](VERIFIED-SOURCES.md).
+**Discovery is free.** Greenhouse, Ashby, Lever, SmartRecruiters and Workable all publish every customer's open roles as unauthenticated JSON, and the sweep probes all five. (Workday publishes the same and a parser for it ships, but probing it needs per-company tenant+site discovery, so the sweep doesn't call it yet.) Combined with Y Combinator's open company directory and the monthly Hacker News "Who is hiring?" thread, that's a complete hiring-signal layer at zero cost and with no API keys. All of it was verified live before being built — see [VERIFIED-SOURCES.md](VERIFIED-SOURCES.md).
 
 **Ranking is opinionated.** Every company gets a 1–10 score built from expected fee (30% of first-year salary, computed from the structured comp ranges Ashby and Lever publish), how stuck their reqs are, and whether they have in-house recruiters — a company with 14 open reqs and no recruiter is a near-perfect buyer, while one with 14 reqs and six recruiters is hostile. Those two look identical in every firmographic filter, which is why the derived signal matters more than the firmographics.
 
 **Review is keyboard-driven.** A two-pane inbox layout designed for 100–150 records/hour: `j`/`k` to move, `a` to approve and auto-advance, `e` to edit any field inline, `r` to mark reviewed. Every field shows where it came from, and disagreeing sources are flagged for you to resolve.
 
-**Sending is paced and personal.** Drafts are generated from the real facts about each company, you edit them, and a governor sends them from your Gmail at a rate you set. Replies and bounces sync back and, when an address bounces, the app offers to draft the next decision-maker at that company.
+**Sending is paced and personal.** Drafts are generated from the real facts about each company, you edit them (or test-send them to your own inbox first), and a governor sends them from your Gmail at a rate you set. Replies and bounces sync back; when an address bounces, the app offers to draft the next decision-maker at that company, and a sent-and-silent message can be followed up with a short bump that threads onto the original conversation.
 
 ## Screens
 
@@ -30,7 +30,7 @@ Every one of those facts is available for free from public job-board APIs. recru
 |---|---|
 | **Pipeline** | Run sources, watch progress, see spend |
 | **Review** | The main surface — approve/reject/edit every record |
-| **Outreach** | Drafts, the paced send queue, and replies |
+| **Outreach** | Drafts, the paced send queue, sent history with follow-ups, and replies |
 | **Settings** | Gmail, keys, rate limits, ICP, templates, suppression |
 
 Full interaction design in [UX.md](UX.md).

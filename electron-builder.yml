@@ -5,12 +5,24 @@ asar: true
 
 directories:
   output: release
-  buildResources: build
 
+# Only the two runtime trees. `dist/**` also swept in dist/tests/*.cjs,
+# dist/seed.cjs and dist/smoke.cjs, which are build artifacts of the test
+# runner and dev scripts, not the app.
+#
+# node_modules is excluded on purpose: electron-builder otherwise copies all
+# production dependencies into the asar, but nothing in it is reachable at
+# runtime — the main process is a single esbuild bundle with only `electron`
+# external (provided by the Electron runtime itself), and the renderer is a
+# fully bundled Vite build. package.json is always included by electron-builder;
+# its `main` points into dist/main.
 files:
-  - dist/**
+  - dist/main/**
+  - dist/renderer/**
+  - "!dist/tests"
   - package.json
   - "!**/*.map"
+  - "!node_modules/**"
 
 mac:
   category: public.app-category.productivity

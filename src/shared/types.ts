@@ -5,6 +5,12 @@
  * never produced by a model. They are only ever observed from a source or typed
  * by the operator. `FieldObservation` is how that is enforced downstream — every
  * value carries the evidence it came from.
+ *
+ * These are the IN-MEMORY shapes, not the storage shapes. schema.sql stores
+ * INTEGER rowid keys for high-volume tables (req, field_observation,
+ * raw_response) and epoch-ms INTEGERs for every timestamp; the row→object
+ * mappers (e.g. toReqDomain in pipeline/scoring.ts) convert at that boundary,
+ * so here ids are strings and timestamps are ISO strings.
  */
 
 export type SourceId =
@@ -42,7 +48,10 @@ export interface FieldObservation {
   field: string;
   value: string | null;
   source: SourceId;
-  /** FK to raw_documents. NOT NULL in the DB — no value without evidence. */
+  /**
+   * FK to raw_response. Nullable in the DB (schema.sql): source observations
+   * carry the evidence they were extracted from; human edits pass null.
+   */
   evidenceId: string | null;
   confidence: Confidence;
   observedAt: string;
@@ -167,6 +176,7 @@ export type Persona =
   | 'coo_ops'
   | 'other';
 
+/** In-memory shape of a `raw_response` row — the evidence store. */
 export interface RawDocument {
   id: string;
   source: SourceId;
@@ -201,6 +211,11 @@ export interface AtsBoard {
   jobs: DiscoveredJob[];
   fetchedAt: string;
   rawBody: string;
+  /**
+   * Pagination did not complete — `jobs` is a prefix, not the board. A partial
+   * board must NEVER reach the req differ: in a differ, absence closes reqs.
+   */
+  partial?: boolean;
 }
 
 export interface SourceResult<T> {

@@ -300,16 +300,19 @@ test('recent funding lifts company quality, and the component is capped at its m
   const qualityOf = (over: Partial<Company>) =>
     score(company(over), reqs).components.find((c) => c.key === 'quality')!;
 
+  // lastRoundAt derives from the same frozen NOW the scorer is handed —
+  // mixing in real Date.now() here made the deltas grow with the calendar
+  // and the assertions would have started failing around mid-2028.
   const cold = qualityOf({ lastRoundAt: null, atsPlatform: null, fundingStage: null, ycBatch: null });
-  const recent = qualityOf({ lastRoundAt: new Date(Date.now() - 60 * 86_400_000).toISOString() });
-  const old = qualityOf({ lastRoundAt: new Date(Date.now() - 900 * 86_400_000).toISOString() });
+  const recent = qualityOf({ lastRoundAt: daysAgo(60) });
+  const old = qualityOf({ lastRoundAt: daysAgo(900) });
 
   assert.ok(recent.points > old.points);
   assert.ok(old.points >= cold.points);
   assert.equal(cold.reason, 'No funding signal');
 
   const maxed = qualityOf({
-    lastRoundAt: new Date(Date.now() - 30 * 86_400_000).toISOString(),
+    lastRoundAt: daysAgo(30),
     ycBatch: 'W25',
   });
   assert.ok(maxed.points <= maxed.max);
@@ -421,7 +424,7 @@ test('rawToTen produces 1..10 for the whole reachable score space, never 0 or 11
 
 test('a maximal company scores 10 and a marginal one still scores at least 1', () => {
   const best = score(
-    company({ headcount: 45, recruiterCount: 0, ycBatch: 'S26', lastRoundAt: new Date(Date.now() - 20 * 86_400_000).toISOString() }),
+    company({ headcount: 45, recruiterCount: 0, ycBatch: 'S26', lastRoundAt: daysAgo(20) }),
     Array.from({ length: 25 }, () =>
       req({ compMin: 250_000, compMax: 350_000, repostCount: 2, publishedAt: daysAgo(200), firstSeenAt: daysAgo(200) }),
     ),
@@ -631,7 +634,7 @@ test('daysOpen returns 0 when there is no start date at all', () => {
 
 test('the headline states role counts, staleness, TA status and fee', () => {
   const r = score(
-    company({ recruiterCount: 0, fundingStage: 'Seed', lastRoundAt: new Date(Date.now() - 90 * 86_400_000).toISOString() }),
+    company({ recruiterCount: 0, fundingStage: 'Seed', lastRoundAt: daysAgo(90) }),
     [
       req({ title: 'Staff Backend Engineer', publishedAt: daysAgo(90), firstSeenAt: daysAgo(90), compMin: 200_000, compMax: 240_000 }),
       req({ title: 'Account Executive', department: 'Sales' }),

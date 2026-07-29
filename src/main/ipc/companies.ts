@@ -7,7 +7,7 @@
  * index instead of a LIKE scan over job descriptions.
  */
 
-import { ipcMain } from 'electron';
+import { handle } from './guard.js';
 import { getDb, all, get, run, tx, ulid, type Db } from '../db/index.js';
 import {
   observeCompany,
@@ -123,7 +123,9 @@ export function listCompanies(db: Db, params: CompanyListParams = {}): CompanyRo
 
   const search = params.search?.trim();
   if (search) {
-    const like = `%${search.replace(/[%_]/g, (m) => `\\${m}`)}%`;
+    // Backslash first: it is the ESCAPE character, so a literal '\' in the
+    // search would otherwise neuter whichever wildcard follows it.
+    const like = `%${search.replace(/\\/g, '\\\\').replace(/[%_]/g, (m) => `\\${m}`)}%`;
     const fts = ftsQuery(search);
     const clauses = [
       `c.name LIKE ? ESCAPE '\\'`,
@@ -151,7 +153,9 @@ export function listCompanies(db: Db, params: CompanyListParams = {}): CompanyRo
   }
 
   const orderBy = SORTS[params.sort ?? 'score'] ?? SORTS.score;
-  const limit = clampInt(params.limit, 1, 5000, 200);
+  // 1,000,000 matches the schema cap: the renderer deliberately loads the
+  // whole list (virtualized). A 5,000 clamp silently hid companies past it.
+  const limit = clampInt(params.limit, 1, 1_000_000, 200);
   const offset = clampInt(params.offset, 0, 1_000_000, 0);
 
   const sql =
@@ -500,11 +504,17 @@ export function bulkCompanyStatus(db: Db, ids: string[], status: string): number
   if (ids.length === 0) return 0;
 
   let changed = 0;
+  const updatedIds: string[] = [];
   tx(db, () => {
     for (const rawId of ids) {
       const companyId = canonicalCompanyId(db, rawId);
       const before = get<{ status: string }>(db, 'SELECT status FROM company WHERE id = ?', companyId);
       if (!before) continue;
+      // Already in the target status: nothing changed, so no audit row and —
+      // crucially — no draft task (re-approving an already-contacted company
+      // would only feed the drainer a guaranteed "already sent" refusal).
+      if (before.status === status) continue;
+      updatedIds.push(companyId);
       run(
         db,
         'UPDATE company SET status = ?, reviewed = 1, reviewed_at = ?, updated_at = ? WHERE id = ?',
@@ -527,7 +537,9 @@ export function bulkCompanyStatus(db: Db, ids: string[], status: string): number
 
   emitEvent('data:changed', { entity: 'company' });
   if (status === 'approved') {
-    for (const id of ids) {
+    // Only ids that actually updated — raw/merged-away ids would enqueue
+    // draft tasks that fail through every retry into dead-letter noise.
+    for (const id of updatedIds) {
       enqueue(db, TASK_GENERATE_DRAFT, { companyId: id }, { dedupeKey: id, priority: 50 });
     }
   }
@@ -759,25 +771,21 @@ function clampInt(v: unknown, lo: number, hi: number, fallback: number): number 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function registerCompanyIpc(): void {
-  ipcMain.handle('listCompanies', async (_e, params: CompanyListParams) => listCompanies(getDb(), params ?? {}));
-  ipcMain.handle('getCompany', async (_e, id: string) => getCompany(getDb(), id));
-  ipcMain.handle('patchCompany', async (_e, id: string, patch: CompanyPatch) => patchCompany(getDb(), id, patch ?? {}));
-  ipcMain.handle('bulkCompanyStatus', async (_e, ids: string[], status: string) =>
-    bulkCompanyStatus(getDb(), Array.isArray(ids) ? ids : [], status),
-  );
-  ipcMain.handle('resolveConflict', async (_e, entityId: string, field: string, observationId: number) => {
+  handle('listCompanies', async (params: CompanyListParams) => listCompanies(getDb(), params));
+  handle('getCompany', async (id: string) => getCompany(getDb(), id));
+  handle('patchCompany', async (id: string, patch: CompanyPatch) => patchCompany(getDb(), id, patch));
+  handle('bulkCompanyStatus', async (ids: string[], status: string) => bulkCompanyStatus(getDb(), ids, status));
+  handle('resolveConflict', async (entityId: string, field: string, observationId: number) => {
     resolveConflict(getDb(), entityId, field, observationId);
   });
 
-  ipcMain.handle('patchContact', async (_e, id: string, patch: ContactPatch) => patchContact(getDb(), id, patch ?? {}));
-  ipcMain.handle('addContact', async (_e, companyId: string, patch: ContactPatch) =>
-    addContact(getDb(), companyId, patch ?? {}),
-  );
-  ipcMain.handle('deleteContact', async (_e, id: string) => {
+  handle('patchContact', async (id: string, patch: ContactPatch) => patchContact(getDb(), id, patch));
+  handle('addContact', async (companyId: string, patch: ContactPatch) => addContact(getDb(), companyId, patch));
+  handle('deleteContact', async (id: string) => {
     deleteContact(getDb(), id);
   });
 
-  ipcMain.handle('findContacts', async (_e, companyId: string) => {
+  handle('findContacts', async (companyId: string) => {
     const db = getDb();
     const cid = canonicalCompanyId(db, companyId);
     await discoverContacts(db, cid, { generateCandidates: true });
@@ -786,7 +794,7 @@ export function registerCompanyIpc(): void {
     return listContacts(db, cid);
   });
 
-  ipcMain.handle('verifyContact', async (_e, id: string) => {
+  handle('verifyContact', async (id: string) => {
     const db = getDb();
     const row = get<{ company_id: string }>(db, 'SELECT company_id FROM contact WHERE id = ?', id);
     if (!row) throw new Error(`Unknown contact: ${id}`);

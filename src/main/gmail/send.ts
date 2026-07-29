@@ -10,6 +10,7 @@
  */
 
 import { getDb, prep } from '../db/index.js';
+import { COMPANY_SUPPRESSION_MATCH } from '../pipeline/suppression.js';
 import {
   getGmailClient,
   gmailCall,
@@ -28,6 +29,8 @@ export interface SendRequest {
   body: string;
   /** ULID of the `send` row. Becomes the X-RecruitAI-Send-Id header value. */
   sendId: string;
+  /** Company the recipient belongs to — lets the last-gate suppression check honour kind='company' rules. */
+  companyId?: string;
   /** Set to continue an existing Gmail thread (follow-ups). */
   threadId?: string;
   /** RFC 5322 Message-ID being replied to, angle brackets included. */
@@ -67,19 +70,22 @@ export function isPlausibleAddress(email: string): boolean {
 /**
  * Last gate before the wire. The queue checks suppression too, but this is the
  * only check that is physically between the operator's intent and Google's
- * servers, so it is repeated here rather than assumed.
+ * servers, so it is repeated here rather than assumed — including the
+ * company-kind rules, which this gate historically skipped.
  */
-export function assertNotSuppressed(email: string): void {
+export function assertNotSuppressed(email: string, companyId?: string): void {
   const normalised = email.trim().toLowerCase();
   const domain = normalised.slice(normalised.lastIndexOf('@') + 1);
 
   const hit = prep(
     getDb(),
-    `SELECT reason FROM suppression
-      WHERE (kind = 'email'  AND lower(value) = ?)
-         OR (kind = 'domain' AND lower(value) = ?)
+    `SELECT s.reason FROM suppression s
+      WHERE (s.kind = 'email'  AND lower(s.value) = ?)
+         OR (s.kind = 'domain' AND lower(s.value) = ?)
+         OR (s.kind = 'company' AND ? IS NOT NULL AND EXISTS (
+               SELECT 1 FROM company co WHERE co.id = ? AND ${COMPANY_SUPPRESSION_MATCH}))
       LIMIT 1`,
-  ).get(normalised, domain) as { reason: string } | undefined;
+  ).get(normalised, domain, companyId ?? null, companyId ?? null) as { reason: string } | undefined;
 
   if (hit) throw new SuppressedRecipientError(normalised, hit.reason);
 }
@@ -110,7 +116,7 @@ export async function sendMessage(req: SendRequest): Promise<SendResult> {
   if (!req.subject.trim()) throw new Error('Refusing to send a message with an empty subject.');
   if (!req.body.trim()) throw new Error('Refusing to send a message with an empty body.');
 
-  assertNotSuppressed(to);
+  assertNotSuppressed(to, req.companyId);
 
   const from = await resolveFromAddress();
   const raw = await buildRawMessage({

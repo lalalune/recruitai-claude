@@ -75,7 +75,7 @@ export function countdown(ms: number | null | undefined): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-function toMillis(at: number | string | null | undefined): number | null {
+export function toMillis(at: number | string | null | undefined): number | null {
   if (at == null) return null;
   if (typeof at === 'number') {
     if (!Number.isFinite(at) || at === 0) return null;
@@ -147,27 +147,6 @@ export function verdictTone(v: string | null | undefined): Tone {
       return 'red';
     case 'role':
       return 'blue';
-    default:
-      return 'default';
-  }
-}
-
-export function statusTone(status: string | null | undefined): Tone {
-  switch (status) {
-    case 'approved':
-    case 'replied':
-    case 'sent':
-      return 'green';
-    case 'rejected':
-    case 'suppressed':
-    case 'bounced':
-      return 'red';
-    case 'scored':
-    case 'enriched':
-    case 'queued':
-      return 'blue';
-    case 'contacted':
-      return 'amber';
     default:
       return 'default';
   }

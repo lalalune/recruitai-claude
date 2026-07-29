@@ -89,7 +89,16 @@ let electronNs: ElectronNs | null | undefined;
 async function electron(): Promise<ElectronNs | null> {
   if (electronNs !== undefined) return electronNs;
   try {
-    const ns = (await import('electron')) as unknown as ElectronNs;
+    // Every real runtime for this module is an esbuild CJS bundle, so a plain
+    // require both exists and resolves synchronously — and it goes through
+    // Module._load, the one seam the test electron stub can patch. A native
+    // dynamic import would bypass that and resolve the electron npm package
+    // (a path string, not the runtime). The import stays as the fallback for
+    // any genuinely ESM context; the BrowserWindow check below decides either
+    // way, and a plain Node process still degrades to "unsupported".
+    const ns = (
+      typeof require === 'function' ? require('electron') : await import('electron')
+    ) as unknown as ElectronNs;
     electronNs = ns && typeof ns.BrowserWindow === 'function' ? ns : null;
   } catch {
     electronNs = null;
@@ -211,7 +220,26 @@ export async function openLoginWindow(opts: { timeoutMs?: number } = {}): Promis
   await getPartitionSession();
 
   if (await isLoggedIn()) {
-    await clearHalt();
+    // No fresh authentication happened here — the old cookie is simply still
+    // present. Clearing a halt on this branch was a one-click retry loop
+    // around a checkpoint/429 day-stop ("Open LinkedIn window" → halt gone).
+    // Only a real sign-in after being signed out clears a halt.
+    const halt = currentHalt();
+    if (halt) {
+      // A checkpoint needs the OPERATOR in a window to clear it — reopen one
+      // (the auto-opened one may have been closed) without touching the halt.
+      if (halt.reason === 'checkpoint') {
+        await showCheckpointWindow();
+        return {
+          loggedIn: true,
+          message: `Checkpoint window reopened — clear it there. Today's stop stays until tomorrow either way.`,
+        };
+      }
+      return {
+        loggedIn: true,
+        message: `Still signed in. Today's stop (${halt.reason}) stays until tomorrow.`,
+      };
+    }
     return { loggedIn: true, message: 'Already signed in.' };
   }
 
@@ -331,7 +359,13 @@ export async function logout(): Promise<void> {
       /* best effort */
     }
   }
-  await clearHalt();
+  // The halt and the day's budget bookkeeping deliberately survive a logout.
+  // Clearing them here would make sign-out → sign-in a retry path around a
+  // day-stop, and the header's promise is that no such path exists. The halt
+  // ends when the condition actually ends: the operator signing back in
+  // (openLoginWindow clears it, because a fresh authenticated session is
+  // LinkedIn's own signal the account is in good standing) or the next local
+  // day — not the discarding of the session that earned it.
   void emitStatus();
 }
 
@@ -442,6 +476,18 @@ export function isEnabled(): boolean {
 interface BudgetRecord {
   used: number;
   lastRequestAt: number;
+}
+
+/** Clock for budget-day arithmetic. Production always runs on Date.now. */
+let now: () => number = Date.now;
+
+/**
+ * Test seam. Budget accounting is calendar-day arithmetic, and the interesting
+ * case is a pacing sleep whose two ends fall on opposite sides of local
+ * midnight — which a test cannot reach on the real clock without waiting there.
+ */
+export function __setNowForTests(fn: (() => number) | null): void {
+  now = fn ?? Date.now;
 }
 
 export function localDay(d = new Date()): string {
@@ -690,9 +736,10 @@ export async function acquireRequestSlot(units = 1): Promise<SlotResult> {
       return { ok: false, reason: `Daily LinkedIn budget exhausted (${status.budgetPerDay}/day).`, status };
     }
 
-    const rec = readBudget();
+    const startDay = localDay(new Date(now()));
+    const rec = readBudget(startDay);
     const gap = REQUEST_GAP_MIN_MS + Math.random() * (REQUEST_GAP_MAX_MS - REQUEST_GAP_MIN_MS);
-    const wait = rec.lastRequestAt + gap - Date.now();
+    const wait = rec.lastRequestAt + gap - now();
     if (wait > 0) await sleep(wait);
 
     // Re-check: a halt can land while we were sleeping through the gap.
@@ -701,7 +748,13 @@ export async function acquireRequestSlot(units = 1): Promise<SlotResult> {
       return { ok: false, reason: after.reason, status: await getStatus() };
     }
 
-    writeBudget({ used: rec.used + units, lastRequestAt: Date.now() });
+    // The gap sleep can cross local midnight, so the day is recomputed AFTER
+    // the wait. Without this the write below would land `rec.used + units` —
+    // the OLD day's running count — under the new day's key, and the fresh
+    // day would start the morning already carrying yesterday's spend.
+    const day = localDay(new Date(now()));
+    const current = day === startDay ? rec : readBudget(day);
+    writeBudget({ used: current.used + units, lastRequestAt: now() }, day);
     const updated = await getStatus();
     void emitStatus(updated);
     return { ok: true, reason: 'ok', status: updated };

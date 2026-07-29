@@ -1,21 +1,33 @@
 /**
  * End-to-end smoke test against LIVE sources. Proves the pipeline actually
  * produces scored, reviewable records — not just that it typechecks.
- * Run: RECRUITAI_DATA=./data/smoke node --experimental-strip-types scripts/smoke.ts
+ * Run: bun run smoke   (optionally RECRUITAI_SMOKE_DATA=./somewhere)
+ *
+ * Deliberately NOT keyed to RECRUITAI_DATA: that variable points at the
+ * operator's real database, and this script starts by deleting its directory.
  */
 import path from 'node:path';
 import fs from 'node:fs';
 import { initDb, getDb, all, get } from '../src/main/db/index.js';
 import { fetchYcCompanies, filterYcIcp, candidateTokens } from '../src/main/sources/seeds.js';
-import { probeAts } from '../src/main/sources/ats.js';
+import { probeAts, type BlockedPlatforms } from '../src/main/sources/ats.js';
 import { scoreCompany, DEFAULT_ICP } from '../src/shared/score.js';
 import type { Company, Requisition, Contact } from '../src/shared/types.js';
 
 async function main() {
 
-  const dir = process.env.RECRUITAI_DATA ?? './data/smoke';
+  const dir = process.env.RECRUITAI_SMOKE_DATA ?? './data/smoke';
+  // Refuse to wipe anything this script did not create. The marker file is
+  // written on first use; a directory holding real data will not have it.
+  const marker = path.join(dir, '.recruitai-smoke');
+  if (fs.existsSync(dir) && !fs.existsSync(marker)) {
+    console.error(`Refusing to delete ${dir}: it was not created by the smoke script.`);
+    console.error('Point RECRUITAI_SMOKE_DATA at a disposable directory.');
+    process.exit(1);
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(marker, 'scratch directory owned by scripts/smoke.ts\n');
   initDb(path.join(dir, 'recruitai.db'));
   const db = getDb();
   console.log('✓ database opened + migrated');
@@ -35,11 +47,15 @@ async function main() {
   let found = 0, totalReqs = 0;
   const scored: {name:string; score:number; headline:string; fee:number|null}[] = [];
 
+  // One shared set across the whole sample, exactly as the real sweep does —
+  // per-company fresh sets re-probe a rate-limiting platform every iteration.
+  const blocked: BlockedPlatforms = new Set();
+
   for (const c of sample) {
     const tokens = candidateTokens(c.name, c.website);
     let board = null;
     for (const t of tokens) {
-      board = await probeAts(t);
+      board = await probeAts(t, blocked);
       if (board) break;
     }
     if (!board) continue;

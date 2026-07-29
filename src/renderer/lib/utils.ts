@@ -92,6 +92,21 @@ export function safeLocalSet(key: string, value: string): void {
   }
 }
 
+export function safeLocalRemove(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    /* same rationale as safeLocalSet */
+  }
+}
+
+/**
+ * Set once the operator genuinely leaves the setup wizard (finish, skip, or
+ * navigating away) — never on arrival. App checks it on launch; Setup writes it
+ * on finish; App also writes it on a real transition away from the screen.
+ */
+export const SETUP_COMPLETE_KEY = 'recruitai.setupComplete';
+
 export function readJson<T>(key: string, fallback: T): T {
   const raw = safeLocalGet(key);
   if (raw == null) return fallback;

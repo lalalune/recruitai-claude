@@ -4,6 +4,7 @@ import { toast } from 'sonner';
 import { AlertTriangle, KeyRound, Play, Square, X } from 'lucide-react';
 import type { PipelineState, SourceKey, SourceStatus } from '../../shared/ipc.js';
 import { api } from '../lib/api.js';
+import { ago } from '../lib/format.js';
 import { cn } from '../lib/utils.js';
 import { ProgressBar, ProgressPanel } from '../components/ProgressPanel.js';
 import { StatusChip } from '../components/StatusChip.js';
@@ -20,16 +21,7 @@ import { useSettings } from './Settings.js';
 
 const PIPELINE_KEY = ['pipeline'] as const;
 
-function goToSettings(onNavigate?: (screen: string) => void) {
-  if (onNavigate) {
-    onNavigate('settings');
-    return;
-  }
-  window.dispatchEvent(new CustomEvent('recruitai:navigate', { detail: { screen: 'settings' } }));
-  window.location.hash = '#/settings';
-}
-
-export function Pipeline({ onNavigate }: { onNavigate?: (screen: string) => void } = {}) {
+export function Pipeline({ onNavigate }: { onNavigate: (screen: string) => void }) {
   const qc = useQueryClient();
   const [confirm, setConfirm] = useState<SourceStatus | null>(null);
   const [dismissed, setDismissed] = useState<string[]>([]);
@@ -171,7 +163,7 @@ export function Pipeline({ onNavigate }: { onNavigate?: (screen: string) => void
                   pipelineRunning={running}
                   onRun={() => start(s)}
                   onToggle={(enabled) => setEnabled.mutate({ key: s.key, enabled })}
-                  onConfigureKey={() => goToSettings(onNavigate)}
+                  onConfigureKey={() => onNavigate('settings')}
                 />
               ))}
             </div>
@@ -303,16 +295,6 @@ function SourceCard({
       )}
     </div>
   );
-}
-
-function ago(ts: number): string {
-  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
-  if (s < 60) return `${s}s ago`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return new Date(ts).toLocaleDateString();
 }
 
 export default Pipeline;

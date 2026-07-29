@@ -45,6 +45,8 @@ export interface SocialProfile {
   slug: string;
   /** The page we actually found it on — recorded as evidence. */
   foundAt: string;
+  /** The bytes of that page — the evidence itself, not just its address. */
+  pageBody: string;
 }
 
 /** Trailing punctuation is common when the match came from prose or JSON. */
@@ -90,6 +92,7 @@ export async function findCompanyLinkedIn(website: string): Promise<SocialProfil
         slug,
         linkedinUrl: `https://www.linkedin.com/company/${slug}`,
         foundAt: url,
+        pageBody: res.body,
       };
     }
   }

@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, Eye, Pencil, RefreshCw, RotateCcw, X } from 'lucide-react';
+import { AlertTriangle, Eye, Pencil, RefreshCw, RotateCcw, Send, X } from 'lucide-react';
+import { toast } from 'sonner';
 import type { ContactRow, DraftRow } from '../../shared/ipc.js';
-import type { VerificationVerdict } from '../../shared/types.js';
+import { DEFAULT_OPT_OUT_LINE } from '../../shared/outreach.js';
+import { api } from '../lib/api.js';
+import { verdictLabel, verdictTone } from '../lib/format.js';
+import { useSettings } from '../screens/Settings.js';
 import { Button } from './ui/button.js';
 import { Input } from './ui/input.js';
 import {
@@ -35,34 +39,17 @@ export function unresolvedVariables(text: string, vars: DraftVariables): string[
   return [...missing];
 }
 
-export function verdictTone(v: VerificationVerdict): 'good' | 'warn' | 'bad' | 'neutral' | 'muted' {
-  switch (v) {
-    case 'valid':
-      return 'good';
-    case 'catch_all':
-      return 'warn';
-    case 'invalid':
-    case 'disposable':
-      return 'bad';
-    case 'role':
-      return 'warn';
-    case 'unknown':
-      return 'neutral';
-    default:
-      return 'muted';
-  }
-}
-
-export function verdictLabel(v: VerificationVerdict): string {
-  return v === 'catch_all' ? 'catch-all' : v.replace('_', ' ');
-}
-
 export interface EmailComposerProps {
   draft: DraftRow;
   /** Every decision-maker at the company, for the To dropdown. */
   contacts: ContactRow[];
   variables: DraftVariables;
   onChange(patch: { subject?: string; body?: string }): void;
+  /**
+   * Awaited before the test send fires — the host flushes its debounced edit
+   * buffer here so the test mail carries the keystrokes of the last 600ms.
+   */
+  onBeforeTest?: () => Promise<void>;
   onSelectContact(contactId: string): void;
   onRegenerate(): void;
   regenerating?: boolean;
@@ -71,9 +58,6 @@ export interface EmailComposerProps {
   previous?: { subject: string; body: string } | null;
   onRestorePrevious?(): void;
   onDiscardPrevious?(): void;
-  /** Appended in preview so what is shown is what will actually send. */
-  optOutLine?: string | null;
-  signature?: string | null;
   actions?: ReactNode;
 }
 
@@ -82,6 +66,7 @@ export function EmailComposer({
   contacts,
   variables,
   onChange,
+  onBeforeTest,
   onSelectContact,
   onRegenerate,
   regenerating = false,
@@ -89,11 +74,10 @@ export function EmailComposer({
   previous = null,
   onRestorePrevious,
   onDiscardPrevious,
-  optOutLine = null,
-  signature = null,
   actions,
 }: EmailComposerProps) {
   const [subject, setSubject] = useState(draft.subject);
+  const [testSending, setTestSending] = useState(false);
   const [body, setBody] = useState(draft.body);
   const [preview, setPreview] = useState(false);
   const [showPrevious, setShowPrevious] = useState(false);
@@ -124,6 +108,33 @@ export function EmailComposer({
     () => [...new Set([...unresolvedVariables(subject, variables), ...unresolvedVariables(body, variables)])],
     [subject, body, variables],
   );
+
+  // Footer divergence: the sender re-appends the opt-out line / postal address
+  // main-side when settings require them (ensureCompliantFooter), so an edit
+  // that removed them here makes the on-screen body diverge from what will
+  // actually send. The detection mirrors the sender's newline-normalised,
+  // line-anchored checks.
+  const { data: settings } = useSettings();
+  const missingFooter = useMemo(() => {
+    const sending = settings?.sending;
+    if (!sending) return [];
+    const out: string[] = [];
+    const normalised = body.replace(/\r\n/g, '\n');
+    if (sending.includeOptOutLine && !normalised.includes(DEFAULT_OPT_OUT_LINE)) {
+      out.push('opt-out line');
+    }
+    const postal = (sending.postalAddress ?? '').trim();
+    if (postal) {
+      const postalLines = postal
+        .replace(/\r\n/g, '\n')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const bodyLines = new Set(normalised.split('\n').map((l) => l.trim()));
+      if (!postalLines.every((l) => bodyLines.has(l))) out.push('postal address');
+    }
+    return out;
+  }, [settings, body]);
 
   const commitSubject = (value: string) => {
     setSubject(value);
@@ -160,9 +171,10 @@ export function EmailComposer({
   };
 
   const renderedSubject = resolveVariables(subject, variables);
-  const renderedBody = [resolveVariables(body, variables), signature || null, optOutLine || null]
-    .filter(Boolean)
-    .join('\n\n');
+  // The stored body is final — signature, opt-out line and postal address were
+  // baked in at generation (and the sender re-appends the compliance footer if
+  // an edit removed it). Appending anything here would preview a double footer.
+  const renderedBody = resolveVariables(body, variables);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -178,6 +190,29 @@ export function EmailComposer({
             <Button variant="ghost" size="sm" onClick={() => setPreview((p) => !p)}>
               {preview ? <Pencil className="mr-1.5 h-3.5 w-3.5" /> : <Eye className="mr-1.5 h-3.5 w-3.5" />}
               {preview ? 'Edit' : 'Preview'}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={testSending}
+              title="Send this draft to your own inbox with a [TEST] subject — no prospect is touched"
+              onClick={() => {
+                setTestSending(true);
+                void (async () => {
+                  // Flush the host's debounced edits first, or the test mail
+                  // would be missing the last ~600ms of typing.
+                  await onBeforeTest?.();
+                  const address = await api.sendTestEmail(draft.id);
+                  toast.success('Test sent', { description: `Check ${address}` });
+                })()
+                  .catch((e: unknown) =>
+                    toast.error('Test send failed', { description: (e as Error).message }),
+                  )
+                  .finally(() => setTestSending(false));
+              }}
+            >
+              <Send className="mr-1.5 h-3.5 w-3.5" />
+              Test to me
             </Button>
             <Button variant="outline" size="sm" onClick={onRegenerate} disabled={regenerating}>
               <RefreshCw className={cn('mr-1.5 h-3.5 w-3.5', regenerating && 'animate-spin')} />
@@ -281,6 +316,17 @@ export function EmailComposer({
             <AlertTriangle className="h-3.5 w-3.5" />
             <span>
               No value for {missing.map((m) => `{{${m}}}`).join(', ')} — it will send literally.
+            </span>
+          </div>
+        )}
+
+        {missingFooter.length > 0 && (
+          <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-xs text-amber-600 dark:text-amber-400">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            <span>
+              The {missingFooter.join(' and ')} {missingFooter.length > 1 ? 'were' : 'was'} removed
+              here — {missingFooter.length > 1 ? 'they' : 'it'} will be re-added automatically when
+              this sends.
             </span>
           </div>
         )}

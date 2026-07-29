@@ -52,16 +52,23 @@ export const DEFAULT_SETTINGS = {
     weekends: false,
     signature: '',
     includeOptOutLine: true,
+    postalAddress: '',
   },
   crawl: {
     concurrency: 10,
     linkedinPerDay: 25,
     linkedinEnabled: false,
   },
+  templates: {
+    under_20: { subject: '', body: '' },
+    '20_75': { subject: '', body: '' },
+    '75_300': { subject: '', body: '' },
+    over_300: { subject: '', body: '' },
+  },
   spendCapUsd: 100,
 };
 
-type Group = 'icp' | 'sending' | 'crawl';
+type Group = 'icp' | 'sending' | 'crawl' | 'templates';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Raw key/value access
@@ -86,10 +93,6 @@ export function setSetting(key: string, value: unknown): void {
     JSON.stringify(value ?? null),
     Date.now(),
   );
-}
-
-export function deleteSetting(key: string): void {
-  run(getDb(), 'DELETE FROM setting WHERE key = ?', key);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,6 +158,9 @@ export function getIcp(): IcpConfig {
   };
 }
 
+// These clamp bounds MUST match src/shared/schemas.ts (sendingPatchSchema,
+// crawlPatchSchema). The boundary accepts what these clamps preserve; a
+// mismatch either rejects legal values or silently rewrites accepted ones.
 export function getSending(): (typeof DEFAULT_SETTINGS)['sending'] {
   const s = readGroup('sending');
   return {
@@ -166,15 +172,33 @@ export function getSending(): (typeof DEFAULT_SETTINGS)['sending'] {
     weekends: s.weekends === true,
     signature: typeof s.signature === 'string' ? s.signature : '',
     includeOptOutLine: s.includeOptOutLine !== false,
+    postalAddress: typeof s.postalAddress === 'string' ? s.postalAddress : '',
   };
 }
 
 export function getCrawl(): (typeof DEFAULT_SETTINGS)['crawl'] {
   const c = readGroup('crawl');
   return {
-    concurrency: clampInt(c.concurrency, 1, 20, DEFAULT_SETTINGS.crawl.concurrency),
-    linkedinPerDay: clampInt(c.linkedinPerDay, 0, 500, DEFAULT_SETTINGS.crawl.linkedinPerDay),
+    concurrency: clampInt(c.concurrency, 1, 32, DEFAULT_SETTINGS.crawl.concurrency),
+    linkedinPerDay: clampInt(c.linkedinPerDay, 0, 200, DEFAULT_SETTINGS.crawl.linkedinPerDay),
     linkedinEnabled: c.linkedinEnabled === true,
+  };
+}
+
+export function getTemplates(): (typeof DEFAULT_SETTINGS)['templates'] {
+  const t = readGroup('templates');
+  const clean = (v: unknown): { subject: string; body: string } => {
+    const o = (v ?? {}) as { subject?: unknown; body?: unknown };
+    return {
+      subject: typeof o.subject === 'string' ? o.subject : '',
+      body: typeof o.body === 'string' ? o.body : '',
+    };
+  };
+  return {
+    under_20: clean(t.under_20),
+    '20_75': clean(t['20_75']),
+    '75_300': clean(t['75_300']),
+    over_300: clean(t.over_300),
   };
 }
 
@@ -226,7 +250,9 @@ export async function getSettings(): Promise<Settings> {
     crawl: getCrawl(),
     gmail: {
       connected: gmailConnected,
-      address: gmailConnected || getAddress() ? getAddress() : null,
+      // The stored address is only meaningful while connected; after a
+      // disconnect it would advertise an account we can no longer send from.
+      address: gmailConnected ? getAddress() : null,
       needsReauth: gmailConnected && needsReauth(),
     },
     keys: {
@@ -236,6 +262,7 @@ export async function getSettings(): Promise<Settings> {
     },
     spendCapUsd: getSpendCapUsd(),
     dataDir: getDataDir(),
+    templates: getTemplates(),
   };
 }
 
@@ -243,6 +270,7 @@ export async function patchSettings(patch: SettingsPatch): Promise<Settings> {
   if (patch.icp) writeGroup('icp', patch.icp);
   if (patch.sending) writeGroup('sending', patch.sending);
   if (patch.crawl) writeGroup('crawl', patch.crawl);
+  if (patch.templates) writeGroup('templates', patch.templates);
   if (patch.spendCapUsd !== undefined && Number.isFinite(patch.spendCapUsd)) {
     const cap = Math.max(0, patch.spendCapUsd);
     setSetting('spendCapUsd', cap);

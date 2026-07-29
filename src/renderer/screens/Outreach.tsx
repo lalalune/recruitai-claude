@@ -13,9 +13,11 @@ import {
   SkipForward,
   Trash2,
 } from 'lucide-react';
-import type { CompanyDetail, ContactRow, DraftRow, InboundRow } from '../../shared/ipc.js';
+import type { CompanyDetail, ContactRow, DraftRow, InboundRow, SentRow } from '../../shared/ipc.js';
 import { api } from '../lib/api.js';
-import { cn } from '../lib/utils.js';
+import { ago, verdictLabel, verdictTone } from '../lib/format.js';
+import { cn, safeLocalGet, safeLocalSet } from '../lib/utils.js';
+import { normalizeOutreachTab, useOverlayOpen, type OutreachTab } from '../store/ui.js';
 import { SplitView } from '../components/SplitView.js';
 import { RankedList } from '../components/RankedList.js';
 import { ListRow } from '../components/ListRow.js';
@@ -25,7 +27,7 @@ import { ScoreBadge } from '../components/ScoreBadge.js';
 import { StatusChip } from '../components/StatusChip.js';
 import { ActionBar } from '../components/ActionBar.js';
 import { EmptyState } from '../components/EmptyState.js';
-import { EmailComposer, verdictLabel, verdictTone, type DraftVariables } from '../components/EmailComposer.js';
+import { EmailComposer, type DraftVariables } from '../components/EmailComposer.js';
 import { Button } from '../components/ui/button.js';
 import { Input } from '../components/ui/input.js';
 import { Switch } from '../components/ui/switch.js';
@@ -36,9 +38,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '../components/ui/dialog.js';
-import { DEFAULT_OPT_OUT_LINE, useSettings, useSettingsPatch } from './Settings.js';
-
-export type OutreachTab = 'drafts' | 'queue' | 'replies';
+import { NumberInput, useSettings, useSettingsPatch } from './Settings.js';
 
 const TAB_STORE = 'recruitai.outreach.tab';
 const DRAFTS_KEY = ['drafts', 'draft'] as const;
@@ -52,13 +52,13 @@ function idOf(x: unknown): string | null {
   return null;
 }
 
-export function Outreach({ initialTab }: { initialTab?: OutreachTab } = {}) {
-  const [tab, setTab] = useState<OutreachTab>(
-    () => initialTab ?? ((localStorage.getItem(TAB_STORE) as OutreachTab | null) ?? 'drafts'),
-  );
+export function Outreach() {
+  // An out-of-enum persisted value falls back to a real tab; the raw cast used
+  // to leave the content area blank when an old tab name was stored.
+  const [tab, setTab] = useState<OutreachTab>(() => normalizeOutreachTab(safeLocalGet(TAB_STORE)));
 
   useEffect(() => {
-    localStorage.setItem(TAB_STORE, tab);
+    safeLocalSet(TAB_STORE, tab);
   }, [tab]);
 
   const { data: stats } = useQuery({ queryKey: STATS_KEY, queryFn: () => api.getSendStats(), refetchInterval: 1000 });
@@ -68,13 +68,14 @@ export function Outreach({ initialTab }: { initialTab?: OutreachTab } = {}) {
   const counts: Record<OutreachTab, number> = {
     drafts: drafts?.length ?? 0,
     queue: stats?.queued ?? 0,
+    sent: 0, // no badge — the Sent list is history, not a work queue
     replies: inbound?.length ?? 0,
   };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-1 border-b border-border px-4">
-        {(['drafts', 'queue', 'replies'] as const).map((t) => (
+        {(['drafts', 'queue', 'sent', 'replies'] as const).map((t) => (
           <button
             key={t}
             type="button"
@@ -103,6 +104,7 @@ export function Outreach({ initialTab }: { initialTab?: OutreachTab } = {}) {
       <div className="min-h-0 flex-1">
         {tab === 'drafts' && <DraftsTab active />}
         {tab === 'queue' && <QueueTab />}
+        {tab === 'sent' && <SentTab onOpenDrafts={() => setTab('drafts')} />}
         {tab === 'replies' && <RepliesTab active onOpenDrafts={() => setTab('drafts')} />}
       </div>
     </div>
@@ -115,7 +117,7 @@ export function Outreach({ initialTab }: { initialTab?: OutreachTab } = {}) {
 
 function DraftsTab({ active }: { active: boolean }) {
   const qc = useQueryClient();
-  const { data: settings } = useSettings();
+  const overlayOpen = useOverlayOpen();
   const { data: drafts = [], isLoading } = useQuery({ queryKey: DRAFTS_KEY, queryFn: () => api.listDrafts('draft') });
 
   const items = useMemo(
@@ -132,11 +134,6 @@ function DraftsTab({ active }: { active: boolean }) {
 
   const index = items.findIndex((d) => d.id === selectedId);
   const selected = index >= 0 ? items[index] : null;
-
-  useEffect(() => {
-    const first = items[0];
-    if (!selected && first) setSelectedId(first.id);
-  }, [items, selected]);
 
   const company = useQuery({
     queryKey: ['company', selected?.companyId],
@@ -212,6 +209,26 @@ function DraftsTab({ active }: { active: boolean }) {
 
   useEffect(() => () => void flush(), [flush]);
 
+  /**
+   * The only way selection may move. The debounced buffer holds the OUTGOING
+   * draft's keystrokes; selecting another row and typing within 600ms would
+   * overwrite `pending` and silently drop them. flush() empties the buffer
+   * synchronously before the await (and no-ops when clean), so it is safe to
+   * fire-and-forget ahead of the selection change.
+   */
+  const select = useCallback(
+    (id: string | null) => {
+      void flush();
+      setSelectedId(id);
+    },
+    [flush],
+  );
+
+  useEffect(() => {
+    const first = items[0];
+    if (!selected && first) select(first.id);
+  }, [items, selected, select]);
+
   const onChange = (patch: { subject?: string; body?: string }) => {
     if (!selected) return;
     const id = selected.id;
@@ -230,8 +247,8 @@ function DraftsTab({ active }: { active: boolean }) {
   const advance = useCallback(() => {
     if (index < 0) return;
     const next = items[index + 1] ?? items[index - 1] ?? null;
-    setSelectedId(next?.id ?? null);
-  }, [index, items]);
+    select(next?.id ?? null);
+  }, [index, items, select]);
 
   const act = useCallback(
     async (kind: 'queue' | 'skip' | 'reject') => {
@@ -254,6 +271,10 @@ function DraftsTab({ active }: { active: boolean }) {
         } else {
           await api.skipDraft(target.id);
           await api.patchCompany(target.companyId, { status: 'rejected', reviewed: true });
+          // Review's list caches forever and id-carrying company events skip
+          // it by design, so this cross-screen status change must invalidate
+          // the list explicitly or Review keeps showing the old status.
+          void qc.invalidateQueries({ queryKey: ['companies', 'list'] });
           toast.success(`Rejected ${target.companyName}`);
         }
         setSelectedId(next?.id ?? null);
@@ -271,7 +292,9 @@ function DraftsTab({ active }: { active: boolean }) {
   const regenerate = useMutation({
     mutationFn: async (d: DraftRow) => {
       await flush();
-      return api.generateDraft(d.companyId, d.contactId);
+      // force: this is the explicit Regenerate button — it may replace an
+      // edited draft, where a plain compose would be refused by the guards.
+      return api.generateDraft(d.companyId, d.contactId, true);
     },
     onSuccess: (row, d) => {
       setPrevious((p) => {
@@ -280,7 +303,7 @@ function DraftsTab({ active }: { active: boolean }) {
         return next;
       });
       qc.invalidateQueries({ queryKey: DRAFTS_KEY });
-      setSelectedId(row.id);
+      select(row.id);
       toast.success('Regenerated', { description: 'The previous version is kept for comparison.' });
     },
     onError: (e: Error) => toast.error('Could not regenerate', { description: e.message }),
@@ -313,13 +336,15 @@ function DraftsTab({ active }: { active: boolean }) {
     },
     onSuccess: (row) => {
       qc.invalidateQueries({ queryKey: DRAFTS_KEY });
-      setSelectedId(row.id);
+      select(row.id);
       toast.success(`Now addressed to ${row.contactName}`);
     },
     onError: (e: Error) => toast.error('Could not switch recipient', { description: e.message }),
   });
 
-  const enabled = active && Boolean(selected);
+  // Gated on overlays like Review's hotkeys: with the palette or shortcut
+  // sheet open, s/x/n must not skip or reject drafts behind it.
+  const enabled = active && Boolean(selected) && !overlayOpen;
   useHotkeys('mod+enter', () => void act('queue'), { enabled, enableOnFormTags: ['input', 'textarea'] }, [act, enabled]);
   useHotkeys('s', () => void act('skip'), { enabled }, [act, enabled]);
   useHotkeys('x', () => void act('reject'), { enabled }, [act, enabled]);
@@ -332,9 +357,9 @@ function DraftsTab({ active }: { active: boolean }) {
       focusedIndex={Math.max(0, index)}
       onFocus={(i: number) => {
         const row = items[i];
-        if (row) setSelectedId(row.id);
+        if (row) select(row.id);
       }}
-      onSelect={(x: DraftRow | string) => setSelectedId(idOf(x))}
+      onSelect={(x: DraftRow | string) => select(idOf(x))}
       renderRow={(d: DraftRow, i: number) => (
         <ListRow
           key={d.id}
@@ -347,14 +372,14 @@ function DraftsTab({ active }: { active: boolean }) {
           ]}
           selected={d.id === selectedId}
           focused={i === index}
-          onClick={() => setSelectedId(d.id)}
+          onClick={() => select(d.id)}
         />
       )}
       emptyState={
         <EmptyState
           icon={<Mail className="h-6 w-6" />}
           title={isLoading ? 'Loading drafts…' : 'No drafts waiting'}
-          description="Approving a company in Review queues its first draft; it appears here within a few seconds."
+          description="Approving a company in Review queues its first draft; it appears here shortly after approval."
         />
       }
     />
@@ -367,6 +392,7 @@ function DraftsTab({ active }: { active: boolean }) {
       contacts={contacts}
       variables={variables}
       onChange={onChange}
+      onBeforeTest={flush}
       onSelectContact={(contactId) => switchContact.mutate({ draft: selected, contactId })}
       onRegenerate={() => regenerate.mutate(selected)}
       regenerating={regenerate.isPending}
@@ -383,8 +409,6 @@ function DraftsTab({ active }: { active: boolean }) {
           return next;
         })
       }
-      signature={settings?.sending.signature ?? null}
-      optOutLine={settings?.sending.includeOptOutLine ? DEFAULT_OPT_OUT_LINE : null}
       actions={
         <ActionBar
           actions={[
@@ -425,9 +449,151 @@ function DraftsTab({ active }: { active: boolean }) {
 // Queue
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Sent — history plus the follow-up work surface
+// ─────────────────────────────────────────────────────────────────────────────
+
+const OUTCOME_TONE: Record<SentRow['outcome'], string> = {
+  sent: 'bg-muted text-muted-foreground',
+  silent: 'bg-muted text-muted-foreground',
+  replied: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400',
+  bounced: 'bg-red-500/15 text-red-600 dark:text-red-400',
+  pending: 'bg-muted text-muted-foreground',
+  failed: 'bg-red-500/15 text-red-600 dark:text-red-400',
+};
+
+function followUpBlocker(row: SentRow): string | null {
+  if (row.outcome === 'replied') return 'They replied — answer the thread';
+  if (row.outcome === 'bounced') return 'Bounced';
+  if (row.hasActiveFollowUp) return 'Follow-up already drafted';
+  if (row.sentAt != null && Date.now() - row.sentAt < 2 * 86_400_000) return 'Sent under 2 days ago';
+  return null;
+}
+
+const KIND_LABEL: Record<string, string> = { builtin: 'Built-in', custom: 'Custom template', follow_up: 'Follow-up' };
+const PERF_BAND_LABEL: Record<string, string> = {
+  under_20: '<20 people',
+  '20_75': '20–75',
+  '75_300': '75–300',
+  over_300: '300+',
+  follow_up: 'Follow-up',
+  unknown: '—',
+};
+
+/** Reply rates by copy — the reason to iterate templates rather than guess. */
+function PerformanceStrip() {
+  const { data: rows = [] } = useQuery({
+    queryKey: ['performance'],
+    queryFn: () => api.getPerformance(),
+    refetchInterval: 60_000,
+  });
+  if (rows.length === 0) return null;
+  return (
+    <div className="border-b border-border/60 px-4 py-2">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-muted-foreground">
+        <span className="font-medium text-foreground">Reply rates</span>
+        {rows.map((r) => (
+          <span key={`${r.band}-${r.kind}`} className="tabular-nums">
+            {PERF_BAND_LABEL[r.band] ?? r.band} · {KIND_LABEL[r.kind] ?? r.kind}:{' '}
+            <span className={cn('font-medium', r.replyRate >= 0.05 ? 'text-emerald-600 dark:text-emerald-400' : 'text-foreground')}>
+              {(r.replyRate * 100).toFixed(1)}%
+            </span>{' '}
+            ({r.replied}/{r.sent}
+            {r.bounced > 0 ? `, ${r.bounced} bounced` : ''})
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SentTab({ onOpenDrafts }: { onOpenDrafts(): void }) {
+  const qc = useQueryClient();
+  const { data: rows = [], isLoading } = useQuery({
+    queryKey: ['sent'],
+    queryFn: () => api.listSent(),
+    refetchInterval: 60_000,
+  });
+
+  const followUp = useMutation({
+    mutationFn: (sendId: string) => api.generateFollowUp(sendId),
+    onSuccess: (draft) => {
+      void qc.invalidateQueries({ queryKey: ['drafts'] });
+      void qc.invalidateQueries({ queryKey: ['sent'] });
+      toast.success(`Follow-up drafted for ${draft.companyName}`, {
+        description: 'It threads onto the original message when sent.',
+        action: { label: 'Open Drafts', onClick: onOpenDrafts },
+      });
+    },
+    onError: (e: Error) => toast.error('No follow-up possible', { description: e.message }),
+  });
+
+  if (isLoading) return <div className="p-8 text-sm text-muted-foreground">Loading sent messages…</div>;
+  if (rows.length === 0) {
+    return (
+      <EmptyState
+        title="Nothing sent yet"
+        description="Messages you send appear here with their outcome, and silent ones can be followed up after two days."
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-full flex-col">
+      <PerformanceStrip />
+      <div className="min-h-0 flex-1 overflow-y-auto">
+      <table className="w-full text-sm">
+        <tbody>
+          {rows.map((r) => {
+            const blocker = followUpBlocker(r);
+            return (
+              <tr key={r.sendId} className="border-b border-border/60 hover:bg-muted/40">
+                <td className="max-w-[16rem] truncate px-4 py-2.5">
+                  <div className="truncate font-medium">{r.companyName}</div>
+                  <div className="truncate text-xs text-muted-foreground">
+                    {r.contactName} · {r.toEmail}
+                  </div>
+                </td>
+                <td className="max-w-[22rem] truncate px-3 py-2.5 text-muted-foreground">
+                  {r.isFollowUp && <span className="mr-1.5 rounded bg-muted px-1 py-0.5 text-[10px] uppercase">follow-up</span>}
+                  {r.subject}
+                </td>
+                <td className="whitespace-nowrap px-3 py-2.5 text-xs text-muted-foreground">
+                  {r.sentAt ? ago(r.sentAt) : '—'}
+                </td>
+                <td className="px-3 py-2.5">
+                  <span className={cn('rounded-full px-2 py-0.5 text-[11px] capitalize', OUTCOME_TONE[r.outcome])}>
+                    {r.outcome}
+                  </span>
+                </td>
+                <td className="whitespace-nowrap px-4 py-2.5 text-right">
+                  {blocker ? (
+                    <span className="text-xs text-muted-foreground">{blocker}</span>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={followUp.isPending}
+                      onClick={() => followUp.mutate(r.sendId)}
+                    >
+                      Follow up
+                    </Button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  );
+}
+
 function QueueTab() {
   const qc = useQueryClient();
   const patch = useSettingsPatch();
+  const overlayOpen = useOverlayOpen();
   const { data: settings } = useSettings();
   const { data: stats } = useQuery({ queryKey: STATS_KEY, queryFn: () => api.getSendStats(), refetchInterval: 1000 });
   const { data: queue = [] } = useQuery({
@@ -437,6 +603,7 @@ function QueueTab() {
   });
 
   const [now, setNow] = useState(() => Date.now());
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
@@ -474,16 +641,54 @@ function QueueTab() {
   });
 
   const remove = useMutation({
-    mutationFn: (id: string) => api.skipDraft(id),
+    mutationFn: (id: string) => api.unqueueDraft(id),
     onSuccess: () => {
       invalidate();
-      toast.success('Removed from queue');
+      toast.success('Returned to Drafts', {
+        description: 'The draft is back in the Drafts tab, untouched.',
+      });
     },
+    onError: (e: Error) => toast.error('Could not unqueue', { description: e.message }),
   });
 
   const ordered = useMemo(
     () => [...queue].sort((a, b) => (a.scheduledAt ?? Infinity) - (b.scheduledAt ?? Infinity)),
     [queue],
+  );
+
+  const index = ordered.findIndex((d) => d.id === selectedId);
+  const selected = index >= 0 ? ordered[index] : null;
+
+  useEffect(() => {
+    const first = ordered[0];
+    if (!selected && first) setSelectedId(first.id);
+  }, [ordered, selected]);
+
+  const removeSelected = useCallback(() => {
+    if (!selected) return;
+    const next = ordered[index + 1] ?? ordered[index - 1] ?? null;
+    remove.mutate(selected.id);
+    setSelectedId(next?.id ?? null);
+  }, [selected, ordered, index, remove]);
+
+  useHotkeys('x', removeSelected, { enabled: Boolean(selected) && !overlayOpen }, [removeSelected, selected, overlayOpen]);
+  useHotkeys(
+    'j,down',
+    () => {
+      const next = ordered[Math.min(index + 1, ordered.length - 1)];
+      if (next) setSelectedId(next.id);
+    },
+    { enabled: ordered.length > 0 && !overlayOpen, preventDefault: true },
+    [ordered, index, overlayOpen],
+  );
+  useHotkeys(
+    'k,up',
+    () => {
+      const prev = ordered[Math.max(index - 1, 0)];
+      if (prev) setSelectedId(prev.id);
+    },
+    { enabled: ordered.length > 0 && !overlayOpen, preventDefault: true },
+    [ordered, index, overlayOpen],
   );
 
   const countdown = stats?.nextSendAt ? Math.max(0, stats.nextSendAt - now) : null;
@@ -562,7 +767,15 @@ function QueueTab() {
           ) : (
             <ol className="divide-y divide-border">
               {ordered.map((d, i) => (
-                <li key={d.id} className="flex items-center gap-3 px-6 py-2.5">
+                <li
+                  key={d.id}
+                  onClick={() => setSelectedId(d.id)}
+                  title="Click to select · x removes it from the queue"
+                  className={cn(
+                    'flex cursor-pointer items-center gap-3 px-6 py-2.5',
+                    d.id === selectedId && 'bg-primary/10',
+                  )}
+                >
                   <span className="w-6 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
                     {i + 1}
                   </span>
@@ -583,7 +796,10 @@ function QueueTab() {
                     type="button"
                     aria-label={`Remove ${d.companyName} from queue`}
                     className="shrink-0 text-muted-foreground hover:text-destructive"
-                    onClick={() => remove.mutate(d.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      remove.mutate(d.id);
+                    }}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -597,18 +813,20 @@ function QueueTab() {
           <Section title="Pacing" defaultOpen>
             <div className="space-y-3 py-1">
               <QueueSetting label="Sends per hour">
-                <NumberBox
+                <NumberInput
                   value={settings?.sending.perHour ?? 20}
                   min={1}
-                  max={100}
+                  max={200}
+                  className="h-7 w-20 text-xs"
                   onCommit={(perHour) => patch.mutate({ sending: { perHour } })}
                 />
               </QueueSetting>
               <QueueSetting label="Sends per day">
-                <NumberBox
+                <NumberInput
                   value={settings?.sending.perDay ?? 150}
                   min={1}
                   max={500}
+                  className="h-7 w-20 text-xs"
                   onCommit={(perDay) => patch.mutate({ sending: { perDay } })}
                 />
               </QueueSetting>
@@ -629,11 +847,12 @@ function QueueTab() {
                 </div>
               </QueueSetting>
               <QueueSetting label="Jitter">
-                <NumberBox
+                <NumberInput
                   value={settings?.sending.jitterPct ?? 40}
                   min={0}
                   max={90}
                   suffix="%"
+                  className="h-7 w-20 text-xs"
                   onCommit={(jitterPct) => patch.mutate({ sending: { jitterPct } })}
                 />
               </QueueSetting>
@@ -664,48 +883,6 @@ function QueueSetting({ label, children }: { label: string; children: ReactNode 
   );
 }
 
-function NumberBox({
-  value,
-  onCommit,
-  min,
-  max,
-  suffix,
-}: {
-  value: number;
-  onCommit(n: number): void;
-  min?: number;
-  max?: number;
-  suffix?: string;
-}) {
-  const [text, setText] = useState(String(value));
-  useEffect(() => setText(String(value)), [value]);
-  const commit = () => {
-    const n = Number(text);
-    if (!Number.isFinite(n)) {
-      setText(String(value));
-      return;
-    }
-    const clamped = Math.min(max ?? Infinity, Math.max(min ?? -Infinity, n));
-    setText(String(clamped));
-    if (clamped !== value) onCommit(clamped);
-  };
-  return (
-    <div className="flex items-center gap-1">
-      <Input
-        type="number"
-        value={text}
-        min={min}
-        max={max}
-        className="h-7 w-20 text-xs"
-        onChange={(e) => setText(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
-      />
-      {suffix && <span className="text-xs text-muted-foreground">{suffix}</span>}
-    </div>
-  );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Replies
 // ─────────────────────────────────────────────────────────────────────────────
@@ -719,6 +896,7 @@ const KIND_TONE: Record<InboundRow['kind'], 'good' | 'bad' | 'warn' | 'neutral'>
 
 function RepliesTab({ active, onOpenDrafts }: { active: boolean; onOpenDrafts(): void }) {
   const qc = useQueryClient();
+  const overlayOpen = useOverlayOpen();
   const [showHandled, setShowHandled] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [bounceOffer, setBounceOffer] = useState<{ company: CompanyDetail; contact: ContactRow } | null>(null);
@@ -808,7 +986,9 @@ function RepliesTab({ active, onOpenDrafts }: { active: boolean; onOpenDrafts():
     onError: (e: Error) => toast.error('Could not draft', { description: e.message }),
   });
 
-  const enabled = active && Boolean(selected);
+  // 'n' suppresses a whole domain — it must never fire behind the palette,
+  // the shortcut sheet, or this tab's own bounce-offer dialog.
+  const enabled = active && Boolean(selected) && !overlayOpen && !bounceOffer;
   useHotkeys('p', () => void mark('positive'), { enabled }, [mark, enabled]);
   useHotkeys('n', () => void mark('negative'), { enabled }, [mark, enabled]);
   useHotkeys('b', () => void mark('bounce'), { enabled }, [mark, enabled]);

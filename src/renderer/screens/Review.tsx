@@ -29,11 +29,12 @@ import type {
 } from '../../shared/ipc.js';
 import type { Persona } from '../../shared/types.js';
 import {
+  api,
   openExternal,
   useAddContact,
-  useAddSuppression,
   useBulkCompanyStatus,
   useCompanies,
+  useServerSearchIds,
   useCompany,
   useDeleteContact,
   useFindContacts,
@@ -90,46 +91,51 @@ import {
 } from '../components/ui/select.js';
 import { Textarea } from '../components/ui/textarea.js';
 
-const STALE_DAYS = 45;
+import { applyView, STALE_DAYS } from '../lib/view.js';
 const ROW_HEIGHT = 46;
 
 export default function Review() {
-  const {
-    filter,
-    setFilter,
-    search,
-    setSearch,
-    sort,
-    setSort,
-    cycleSort,
-    toggles,
-    toggle,
-    focusedIndex,
-    setFocusedIndex,
-    selectedId,
-    setSelectedId,
-    marked,
-    anchorIndex,
-    toggleMarked,
-    markRange,
-    clearMarked,
-    setLightboxIndex,
-    lightboxIndex,
-    setCommands,
-    pushUndo,
-    popUndo,
-  } = useUi();
+  // Selector-based subscriptions: subscribing to the whole store would rerender
+  // this screen (and its 5,000-row list) on every unrelated store write.
+  const filter = useUi((s) => s.filter);
+  const setFilter = useUi((s) => s.setFilter);
+  const search = useUi((s) => s.search);
+  const setSearch = useUi((s) => s.setSearch);
+  const sort = useUi((s) => s.sort);
+  const setSort = useUi((s) => s.setSort);
+  const cycleSort = useUi((s) => s.cycleSort);
+  const toggles = useUi((s) => s.toggles);
+  const toggle = useUi((s) => s.toggle);
+  const focusedIndex = useUi((s) => s.focusedIndex);
+  const setFocusedIndex = useUi((s) => s.setFocusedIndex);
+  const selectedId = useUi((s) => s.selectedId);
+  const setSelectedId = useUi((s) => s.setSelectedId);
+  const marked = useUi((s) => s.marked);
+  const anchorIndex = useUi((s) => s.anchorIndex);
+  const setAnchorIndex = useUi((s) => s.setAnchorIndex);
+  const toggleMarked = useUi((s) => s.toggleMarked);
+  const markRange = useUi((s) => s.markRange);
+  const clearMarked = useUi((s) => s.clearMarked);
+  const setLightboxIndex = useUi((s) => s.setLightboxIndex);
+  const lightboxIndex = useUi((s) => s.lightboxIndex);
+  const setCommands = useUi((s) => s.setCommands);
+  const pushUndo = useUi((s) => s.pushUndo);
+  const popUndo = useUi((s) => s.popUndo);
   const overlayOpen = useOverlayOpen();
 
   const { data: rows, isLoading, isError, error, refetch } = useCompanies();
   const all = useMemo(() => rows ?? [], [rows]);
 
-  const filtered = useMemo(() => applyView(all, filter, toggles, search, sort), [
+  // Contact-name and req-title matches live only in the main process (FTS);
+  // the debounced server id-set widens the instant client filter.
+  const serverSearchIds = useServerSearchIds(search);
+  const filtered = useMemo(() => applyView(all, filter, toggles, search, sort, serverSearchIds), [
     all,
     filter,
     toggles,
     search,
     sort,
+    serverSearchIds,
   ]);
 
   const listRef = useRef<RankedListHandle>(null);
@@ -142,14 +148,13 @@ export default function Review() {
 
   // Only the mutate functions are pulled out: the result objects from
   // useMutation are new on every render, and putting one in a dependency array
-  // makes every memoised callback churn.
-  const { mutate: patchCompany } = usePatchCompany();
+  // makes every memoised callback churn. (mutate/mutateAsync are stable refs.)
+  const { mutate: patchCompany, mutateAsync: patchCompanyAsync } = usePatchCompany();
   const { mutate: bulkStatus } = useBulkCompanyStatus();
   const { mutate: resolveConflict } = useResolveConflict();
   const { mutateAsync: findContactsAsync } = useFindContacts();
   const { mutate: verifyContact } = useVerifyContact();
   const { mutate: generateDraft } = useGenerateDraft();
-  const { mutate: addSuppression } = useAddSuppression();
 
   // ── selection plumbing ────────────────────────────────────────────────────
 
@@ -158,11 +163,13 @@ export default function Review() {
       if (filtered.length === 0) return;
       const i = clamp(index, 0, filtered.length - 1);
       setFocusedIndex(i);
+      // A plain click or keyboard move re-plants the shift+click anchor here.
+      setAnchorIndex(i);
       listRef.current?.scrollToIndex(i);
       if (opts?.select !== false) setSelectedId(filtered[i]?.id ?? null);
       prefetch(filtered[i + 1]?.id);
     },
-    [filtered, prefetch, setFocusedIndex, setSelectedId],
+    [filtered, prefetch, setAnchorIndex, setFocusedIndex, setSelectedId],
   );
 
   // Approving under the "Unreviewed" filter removes the record mid-flight, so
@@ -211,6 +218,17 @@ export default function Review() {
     [filtered.length, focusedIndex, focusAt],
   );
 
+  // Marks and the shift+click anchor are positions in the CURRENT view. After
+  // a filter/sort/search/toggle change they would map onto arbitrary rows of a
+  // re-ordered list, so any view change drops them. The ref-compare skips the
+  // mount run: marks survive a round-trip to another screen.
+  const viewKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = JSON.stringify([filter, sort, search, toggles]);
+    if (viewKeyRef.current !== null && viewKeyRef.current !== key) clearMarked();
+    viewKeyRef.current = key;
+  }, [filter, sort, search, toggles, clearMarked]);
+
   // ── actions ───────────────────────────────────────────────────────────────
 
   const setStatus = useCallback(
@@ -222,7 +240,11 @@ export default function Review() {
       patchCompany({ id: row.id, patch: { status, reviewed: true } });
       pushUndo({
         label: `${status === 'approved' ? 'Approved' : 'Rejected'} ${row.name}`,
-        run: () => patchCompany({ id: row.id, patch: { status: prevStatus, reviewed: prevReviewed } }),
+        // mutateAsync: the undo invoker awaits this, and "Undone" must reflect
+        // the IPC actually succeeding — the void mutate resolved immediately.
+        run: async () => {
+          await patchCompanyAsync({ id: row.id, patch: { status: prevStatus, reviewed: prevReviewed } });
+        },
       });
 
       if (advance && nextId) {
@@ -230,7 +252,7 @@ export default function Review() {
         setSelectedId(nextId);
       }
     },
-    [filtered, focusedIndex, patchCompany, pushUndo, setSelectedId],
+    [filtered, focusedIndex, patchCompany, patchCompanyAsync, pushUndo, setSelectedId],
   );
 
   const current = detail ?? (filtered[focusedIndex] as CompanyRow | undefined) ?? null;
@@ -249,9 +271,11 @@ export default function Review() {
     patchCompany({ id: current.id, patch: { reviewed: next } });
     pushUndo({
       label: `${next ? 'Marked' : 'Unmarked'} ${current.name} reviewed`,
-      run: () => patchCompany({ id: current.id, patch: { reviewed: !next } }),
+      run: async () => {
+        await patchCompanyAsync({ id: current.id, patch: { reviewed: !next } });
+      },
     });
-  }, [current, patchCompany, pushUndo]);
+  }, [current, patchCompany, patchCompanyAsync, pushUndo]);
 
   const compose = useCallback(() => {
     if (!current) return;
@@ -290,15 +314,40 @@ export default function Review() {
     toast.info(`Verifying ${plural(targets.length, 'address', 'addresses')}…`);
   }, [detail, verifyContact]);
 
-  const undo = useCallback(() => {
+  const undo = useCallback(async () => {
     const entry = popUndo();
     if (!entry) {
       toast.info('Nothing to undo');
       return;
     }
-    void entry.run();
-    toast.success('Undone', { description: entry.label });
+    // Undo closures do real IPC (delete suppressions, restore statuses);
+    // "Undone" must not appear before — or instead of — their failure.
+    try {
+      await entry.run();
+      toast.success('Undone', { description: entry.label });
+    } catch (e) {
+      toast.error('Undo failed', { description: (e as Error).message });
+    }
   }, [popUndo]);
+
+  /** Field edits from the detail pane go through here so ⌘Z can revert them. */
+  const patchFieldWithUndo = useCallback(
+    (patch: CompanyPatch) => {
+      if (!detail) return;
+      const before: Record<string, unknown> = {};
+      for (const key of Object.keys(patch)) {
+        before[key] = (detail as unknown as Record<string, unknown>)[key] ?? null;
+      }
+      patchCompany({ id: detail.id, patch });
+      pushUndo({
+        label: `Edited ${Object.keys(patch).map(fieldLabel).join(', ')} on ${detail.name}`,
+        run: async () => {
+          await patchCompanyAsync({ id: detail.id, patch: before as CompanyPatch, quiet: true });
+        },
+      });
+    },
+    [detail, patchCompany, patchCompanyAsync, pushUndo],
+  );
 
   // ── keyboard map ──────────────────────────────────────────────────────────
 
@@ -349,8 +398,17 @@ export default function Review() {
     if (!editFocusedField()) moveFieldFocus(1);
   }, hk, []);
 
-  useHotkeys('tab', () => moveFieldFocus(1), hk, []);
-  useHotkeys('shift+tab', () => moveFieldFocus(-1), hk, []);
+  // Tab walks fields only while focus is already inside the detail pane's
+  // field context; everywhere else (filter chips, search, buttons) it keeps its
+  // native meaning, so preventDefault is applied conditionally in the handler.
+  const fieldWalk = useCallback((dir: 1 | -1, e: KeyboardEvent) => {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !active.closest('[data-detail-pane]')) return;
+    e.preventDefault();
+    moveFieldFocus(dir);
+  }, []);
+  useHotkeys('tab', (e) => fieldWalk(1, e), { enabled: !overlayOpen }, [fieldWalk, overlayOpen]);
+  useHotkeys('shift+tab', (e) => fieldWalk(-1, e), { enabled: !overlayOpen }, [fieldWalk, overlayOpen]);
 
   useHotkeys(
     'escape',
@@ -400,38 +458,131 @@ export default function Review() {
       return;
     }
     if (mods?.shift) {
-      const from = anchorIndex ?? focusedIndex;
+      // Range from the stored anchor. The row's onMouseDown has already moved
+      // focusedIndex to the shift-clicked row, so the anchor — planted by the
+      // last plain click or keyboard move — is the only honest range origin.
+      // It deliberately stays put so another shift+click re-aims from it.
+      const from = clamp(anchorIndex ?? index, 0, filtered.length - 1);
       const [lo, hi] = from <= index ? [from, index] : [index, from];
-      markRange(
-        filtered.slice(lo, hi + 1).map((r) => r.id),
-        index,
-      );
+      markRange(filtered.slice(lo, hi + 1).map((r) => r.id));
       return;
     }
     clearMarked();
-    focusAt(index);
+    focusAt(index); // also plants the anchor on the clicked row
   };
+
+  /** Snapshot of the fields a status-changing bulk action clobbers. */
+  const snapshotStatuses = useCallback(
+    (ids: string[]) =>
+      all
+        .filter((r) => ids.includes(r.id))
+        .map((r) => ({ id: r.id, status: r.status, reviewed: r.reviewed })),
+    [all],
+  );
+
+  /**
+   * Restore a status snapshot, quietly, collecting failures into ONE error
+   * (surfaced by the undo invoker) instead of a toast per row.
+   */
+  const restoreStatuses = useCallback(
+    async (prev: { id: string; status: string; reviewed: boolean }[]) => {
+      const results = await Promise.allSettled(
+        prev.map((p) =>
+          patchCompanyAsync({
+            id: p.id,
+            patch: { status: p.status, reviewed: p.reviewed },
+            quiet: true,
+          }),
+        ),
+      );
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      if (failed) throw new Error(`${failed} of ${prev.length} could not be restored`);
+    },
+    [patchCompanyAsync],
+  );
 
   const bulk = (status: 'approved' | 'rejected') => {
     const ids = [...marked];
     if (!ids.length) return;
+    const prev = snapshotStatuses(ids);
     bulkStatus({ ids, status });
+    pushUndo({
+      label: `${ids.length} companies ${status}`,
+      run: () => restoreStatuses(prev),
+    });
     clearMarked();
     toast.success(`${ids.length} companies ${status}`);
   };
 
-  const suppressMarked = () => {
-    const domains = all
-      .filter((r) => marked.includes(r.id) && r.domain)
-      .map((r) => r.domain as string);
+  const suppressMarked = async () => {
+    const ids = [...marked];
+    const domains = [
+      ...new Set(all.filter((r) => ids.includes(r.id) && r.domain).map((r) => r.domain as string)),
+    ];
     if (!domains.length) {
       toast.error('Selected companies have no domain to suppress');
       return;
     }
-    for (const d of domains) addSuppression({ kind: 'domain', value: d, reason: 'manual' });
-    bulkStatus({ ids: [...marked], status: 'suppressed' });
-    clearMarked();
-    toast.success(`Suppressed ${plural(domains.length, 'domain')}`);
+    // The main process suppresses EVERY company on a suppressed domain, not
+    // just the marked rows, so the restore snapshot covers all of them.
+    const domainSet = new Set(domains);
+    const affected = all
+      .filter((r) => r.domain && domainSet.has(r.domain))
+      .map((r) => ({ id: r.id, status: r.status, reviewed: r.reviewed }));
+    try {
+      const before = new Set((await api.listSuppressions()).map((r) => r.id));
+      for (const d of domains) await api.addSuppression('domain', d, 'manual');
+      bulkStatus({ ids, status: 'suppressed' });
+      // Diff instead of value lookup: undo may only delete rows THIS action
+      // created. A pre-existing row for the same domain — or a replied-no
+      // opt-out recorded between action and undo — must survive.
+      const createdIds = (await api.listSuppressions())
+        .filter((r) => !before.has(r.id))
+        .map((r) => r.id);
+      pushUndo({
+        label: `Suppressed ${plural(domains.length, 'domain')}`,
+        run: async () => {
+          for (const sid of createdIds) await api.removeSuppression(sid);
+          // removeSuppression resets matching companies to 'scored'; put every
+          // affected company back to its snapshotted status instead. Cache
+          // freshness rides on the company+suppression events main emits.
+          await restoreStatuses(affected);
+        },
+      });
+      clearMarked();
+      toast.success(`Suppressed ${plural(domains.length, 'domain')}`);
+    } catch (e) {
+      toast.error('Could not suppress', { description: (e as Error).message });
+    }
+  };
+
+  const exportMarkedCsv = () => {
+    const ids = [...marked];
+    void api
+      .exportCsv('companies', ids.length ? ids : undefined)
+      .then((path) =>
+        toast.success(ids.length ? `Exported ${plural(ids.length, 'selected company', 'selected companies')}` : 'Exported all companies', {
+          description: path,
+        }),
+      )
+      .catch((e: Error) => toast.error('Export failed', { description: e.message }));
+  };
+
+  const rediscoverMarked = () => {
+    const ids = [...marked];
+    if (!ids.length) return;
+    toast.promise(
+      (async () => {
+        let onFile = 0;
+        for (const id of ids) onFile += (await api.findContacts(id)).length;
+        return onFile;
+      })(),
+      {
+        loading: `Re-running contact discovery for ${plural(ids.length, 'company', 'companies')}…`,
+        success: (n) => `Done — ${plural(n, 'contact')} on file across the selection`,
+        error: 'Contact discovery failed',
+      },
+    );
   };
 
   // ── render ────────────────────────────────────────────────────────────────
@@ -584,6 +735,8 @@ export default function Review() {
               tone: 'destructive',
             },
             { key: '⛔', label: 'Suppress domains', onClick: suppressMarked },
+            { label: 'Re-discover contacts', onClick: rediscoverMarked },
+            { label: 'Export CSV', onClick: exportMarkedCsv },
           ]}
           trailing={
             <Button size="xs" variant="ghost" onClick={clearMarked}>
@@ -604,7 +757,7 @@ export default function Review() {
             <WhySection detail={detail} />
             <CompanyFieldsSection
               detail={detail}
-              onPatch={(patch) => patchCompany({ id: detail.id, patch })}
+              onPatch={patchFieldWithUndo}
               onResolve={(field, obsId) =>
                 resolveConflict({ entityId: detail.id, field, observationId: obsId })
               }
@@ -614,7 +767,7 @@ export default function Review() {
             <EvidenceSection detail={detail} onOpen={setLightboxIndex} />
             <NotesSection
               detail={detail}
-              onSaveNotes={(notes) => patchCompany({ id: detail.id, patch: { notes } })}
+              onSaveNotes={(notes) => patchFieldWithUndo({ notes })}
             />
             <div className="h-8" />
           </DetailPane>
@@ -724,51 +877,7 @@ function rowChips(row: CompanyRow): RowChip[] {
   return chips;
 }
 
-function applyView(
-  rows: CompanyRow[],
-  filter: string,
-  toggles: { hasVerifiedEmail: boolean; noInhouseTa: boolean; staleOnly: boolean },
-  search: string,
-  sort: SortKey,
-): CompanyRow[] {
-  const q = search.trim().toLowerCase();
-
-  const out = rows.filter((r) => {
-    if (filter === 'unreviewed' && r.reviewed) return false;
-    if (filter === 'conflicts' && !r.hasConflict) return false;
-    if (filter === 'approved' && r.status !== 'approved') return false;
-    if (filter === 'rejected' && r.status !== 'rejected') return false;
-
-    if (toggles.hasVerifiedEmail && r.verifiedContactCount === 0) return false;
-    if (toggles.noInhouseTa && r.hasInhouseTa !== false && (r.recruiterCount ?? 1) > 0) return false;
-    if (toggles.staleOnly && !(r.staleReqCount > 0 || (r.maxDaysOpen ?? 0) >= STALE_DAYS)) {
-      return false;
-    }
-
-    if (q) {
-      const hay = `${r.name} ${r.domain ?? ''} ${r.industry ?? ''} ${r.ycBatch ?? ''}`.toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  });
-
-  // `recent` is the order the server returned, so it needs no comparator.
-  if (sort === 'recent') return out;
-
-  const cmp: Record<Exclude<SortKey, 'recent'>, (a: CompanyRow, b: CompanyRow) => number> = {
-    score: (a, b) => (b.qualityScore ?? -1) - (a.qualityScore ?? -1),
-    reqs: (a, b) => b.openReqCount - a.openReqCount,
-    days_open: (a, b) => (b.maxDaysOpen ?? -1) - (a.maxDaysOpen ?? -1),
-    fee: (a, b) => (b.estimatedFeeUsd ?? -1) - (a.estimatedFeeUsd ?? -1),
-    name: (a, b) => a.name.localeCompare(b.name),
-  };
-
-  // Score is the tiebreaker everywhere else so the top of any list stays useful.
-  const primary = cmp[sort];
-  return out.sort(
-    (a, b) => primary(a, b) || (b.qualityScore ?? -1) - (a.qualityScore ?? -1) || a.name.localeCompare(b.name),
-  );
-}
+// applyView lives in lib/view.ts (pure, node-testable).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Detail sections
@@ -904,6 +1013,11 @@ function CompanyFieldsSection({
   return (
     <Section title="Company" storageKey="company">
       <div className="flex flex-col gap-0.5">
+        {field('Name', 'name', detail.name, {
+          // CompanyPatch.name is non-nullable; emptying the field keeps the
+          // current name instead of writing null.
+          parse: (v) => (v.trim() === '' ? detail.name : v.trim()),
+        })}
         {field('Domain', 'domain', detail.domain)}
         {field('Website', 'website', detail.website, { type: 'url' })}
         {field('Headcount', 'headcount', detail.headcount?.toString() ?? null, {
@@ -1311,12 +1425,19 @@ function NotesSection({
 }) {
   const [draft, setDraft] = useState(detail.notes ?? '');
   const idRef = useRef(detail.id);
+  const areaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (idRef.current !== detail.id) {
       idRef.current = detail.id;
       setDraft(detail.notes ?? '');
+      return;
     }
+    // Same record, notes changed externally (⌘Z undo, event-driven refetch):
+    // adopt the new value unless the operator is mid-edit in the textarea —
+    // otherwise the stale local buffer would be re-saved over it on blur.
+    // Unfocused implies no unsaved keystrokes, since blur is what saves.
+    if (document.activeElement !== areaRef.current) setDraft(detail.notes ?? '');
   }, [detail.id, detail.notes]);
 
   const history = useMemo(() => {
@@ -1329,6 +1450,7 @@ function NotesSection({
   return (
     <Section title="Notes & history" storageKey="notes" defaultOpen={false}>
       <Textarea
+        ref={areaRef}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => draft !== (detail.notes ?? '') && onSaveNotes(draft)}

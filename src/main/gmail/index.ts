@@ -96,12 +96,7 @@ export interface GmailStatus {
   needsReauth: boolean;
 }
 
-/** Shaped to drop straight into `Settings.gmail`. */
-export async function getGmailStatus(): Promise<GmailStatus> {
-  const connected = await isConnected();
-  return {
-    connected,
-    address: getAddress(),
-    needsReauth: connected && needsReauth(),
-  };
-}
+// (A getGmailStatus helper lived here shaped for Settings.gmail; the settings
+// module composes that block itself from isConnected/getAddress/needsReauth,
+// so the duplicate — with subtly different disconnected-address semantics —
+// was removed rather than left to drift.)

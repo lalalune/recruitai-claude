@@ -112,6 +112,8 @@ scoring ─────────── GATE ───────────
 | LLM | **Haiku 4.5 bulk → Sonnet 5 on ~15%** | ~$35–60 for 30k contacts with Batch API + prompt caching. Trap: Haiku 4.5's minimum cacheable prefix is 4096 tokens — a short system prompt silently never caches. |
 | Secrets | **1Password CLI or macOS Keychain**, never `.env` in repo | Session cookies especially. |
 
+> **As built:** this table is the pre-build research plan, kept for the reasoning. The shipped app took a different shape: an Electron desktop app with `node:sqlite` instead of Postgres, the queue and cost ledger as SQLite tables, TypeScript throughout instead of Python orchestration, and secrets in the OS keychain via Electron `safeStorage`. See [README.md](README.md) for the real architecture.
+
 ### Entity resolution
 
 Three-tier cascade, not one technique.

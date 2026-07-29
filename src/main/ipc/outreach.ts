@@ -12,16 +12,20 @@
  * never silently retried, because a double-send is worse than a missed send.
  */
 
-import { ipcMain } from 'electron';
+import { handle } from './guard.js';
 import { getDb, all, get, run, tx, ulid, type Db } from '../db/index.js';
 import { getSending } from '../settings.js';
-import { emitEvent } from '../pipeline/run.js';
-import { generateDraftFor, DraftNotPossible } from '../pipeline/drafts.js';
+import { emitEvent, appendLog } from '../pipeline/run.js';
+import { generateDraftFor, followUpDraftFor, DraftNotPossible } from '../pipeline/drafts.js';
 import { recomputeCompany } from '../pipeline/scoring.js';
 import { auditLog } from './companies.js';
 import * as gmail from '../gmail/index.js';
 import { SuppressedRecipientError } from '../gmail/send.js';
-import type { DraftRow, InboundRow, SendStats } from '../../shared/ipc.js';
+import { GmailAuthError, GmailQuotaError } from '../gmail/oauth.js';
+import { isFreemailDomain } from '../verify/mx.js';
+import { companySuppressionValues, COMPANY_SUPPRESSION_MATCH } from '../pipeline/suppression.js';
+import { ensureCompliantFooter } from '../../shared/outreach.js';
+import type { DraftRow, InboundRow, PerformanceRow, SendStats, SentRow } from '../../shared/ipc.js';
 import type { VerificationVerdict } from '../../shared/types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -43,7 +47,13 @@ const SENDABLE_PREDICATE = `
     SELECT 1 FROM suppression s
      WHERE (s.kind = 'email'   AND lower(s.value) = lower(c.email))
         OR (s.kind = 'domain'  AND lower(s.value) = lower(substr(c.email, instr(c.email, '@') + 1)))
-        OR (s.kind = 'company' AND (s.value = co.id OR (co.domain IS NOT NULL AND lower(s.value) = lower(co.domain))))
+        OR (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH})
+  )
+  -- Never email someone whose reply the operator has not read yet. Sending is
+  -- automated; opt-out intake is human — this is the bridge between the two.
+  AND NOT EXISTS (
+    SELECT 1 FROM inbound i JOIN send s2 ON s2.id = i.send_id
+     WHERE s2.contact_id = c.id AND i.handled = 0
   )
 `;
 
@@ -144,6 +154,117 @@ export function patchDraft(db: Db, id: string, patch: { subject?: string; body?:
 }
 
 /** Queue a draft, assigning the next free slot in the paced schedule. */
+/** Return a queued draft to Drafts — the honest inverse of queueDraft. */
+export function unqueueDraft(db: Db, id: string): void {
+  const res = run(
+    db,
+    `UPDATE draft SET state = 'draft', scheduled_at = NULL, updated_at = ? WHERE id = ? AND state = 'queued'`,
+    Date.now(),
+    id,
+  );
+  if (Number(res.changes) === 0) {
+    throw new Error('Only a queued draft can be returned to Drafts.');
+  }
+  auditLog(db, { actor: 'operator', action: 'unqueueDraft', entity: 'draft', entityId: id });
+  emitEvent('data:changed', { entity: 'draft', id });
+  emitSendProgress(db);
+}
+
+/**
+ * Send the draft's exact content to the operator's own address, subject
+ * prefixed [TEST]. No send row, no pacing charge, no contact touched — this
+ * is how the operator checks rendering and spam placement before real sends.
+ */
+export async function sendTestEmail(db: Db, id: string): Promise<string> {
+  const draft = readDraft(db, id);
+  if (!(await gateway.isConnected())) throw new Error('Gmail is not connected.');
+  const address = gateway.getAddress();
+  if (!address) {
+    throw new Error('The connected address is unknown — run "Test connection" in Settings first.');
+  }
+  // Same footer backstop as the real send path — a test that exercises a
+  // different message than the one that will leave is not a test.
+  const sending = getSending();
+  const body = ensureCompliantFooter(draft.body, {
+    includeOptOutLine: sending.includeOptOutLine,
+    postalAddress: sending.postalAddress,
+  });
+  await gateway.sendMessage({
+    to: address,
+    subject: `[TEST] ${draft.subject}`,
+    body,
+    sendId: `test-${ulid()}`,
+  });
+  auditLog(db, { actor: 'operator', action: 'sendTestEmail', entity: 'draft', entityId: id, after: { to: address } });
+  return address;
+}
+
+interface SentRowRaw {
+  sendId: string;
+  draftId: string;
+  companyId: string;
+  companyName: string;
+  contactId: string;
+  contactName: string;
+  toEmail: string;
+  subject: string;
+  sentAt: number | null;
+  outcome: SentRow['outcome'];
+  isFollowUp: number;
+  hasActiveFollowUp: number;
+}
+
+/** Sent messages with outcomes, newest first — the follow-up work surface. */
+export function listSent(db: Db): SentRow[] {
+  return all<SentRowRaw>(
+    db,
+    `SELECT s.id AS sendId, s.draft_id AS draftId, s.company_id AS companyId, co.name AS companyName,
+            s.contact_id AS contactId, c.full_name AS contactName, s.to_email AS toEmail, s.subject,
+            s.sent_at AS sentAt, s.outcome,
+            (d.follow_up_of IS NOT NULL) AS isFollowUp,
+            EXISTS (SELECT 1 FROM draft f WHERE f.follow_up_of = s.id AND f.state IN ('draft','queued','sending','failed')) AS hasActiveFollowUp
+       FROM send s
+       JOIN company co ON co.id = s.company_id
+       JOIN contact c ON c.id = s.contact_id
+       JOIN draft d ON d.id = s.draft_id
+      WHERE s.outcome IN ('sent','silent','replied','bounced')
+      ORDER BY s.sent_at IS NULL, s.sent_at DESC, s.created_at DESC
+      LIMIT 500`,
+  ).map((r) => ({ ...r, isFollowUp: r.isFollowUp === 1, hasActiveFollowUp: r.hasActiveFollowUp === 1 }));
+}
+
+/**
+ * Reply/bounce rates by template band and copy kind. This is the whole
+ * copy-iteration loop: every send already records which band and which kind
+ * of copy (built-in, operator template, follow-up bump) produced it, so
+ * "which copy works" is one GROUP BY away instead of a guess.
+ */
+export function getPerformance(db: Db): PerformanceRow[] {
+  const rows = all<{ band: string | null; kind: string; sent: number; replied: number; bounced: number }>(
+    db,
+    `SELECT COALESCE(d.template, 'unknown') AS band,
+            CASE WHEN d.generated_by LIKE 'followup%' THEN 'follow_up'
+                 WHEN d.generated_by LIKE 'custom%'   THEN 'custom'
+                 ELSE 'builtin' END AS kind,
+            count(*) AS sent,
+            COALESCE(sum(CASE WHEN s.outcome = 'replied' THEN 1 ELSE 0 END), 0) AS replied,
+            COALESCE(sum(CASE WHEN s.outcome = 'bounced' THEN 1 ELSE 0 END), 0) AS bounced
+       FROM send s
+       JOIN draft d ON d.id = s.draft_id
+      WHERE s.outcome IN ('sent','silent','replied','bounced')
+      GROUP BY band, kind
+      ORDER BY sent DESC`,
+  );
+  return rows.map((r) => ({
+    band: r.band ?? 'unknown',
+    kind: (r.kind as PerformanceRow['kind']) ?? 'builtin',
+    sent: r.sent,
+    replied: r.replied,
+    bounced: r.bounced,
+    replyRate: r.sent > 0 ? r.replied / r.sent : 0,
+  }));
+}
+
 export function queueDraft(db: Db, id: string): void {
   const row = get<{ id: string; email: string | null }>(
     db,
@@ -157,14 +278,37 @@ export function queueDraft(db: Db, id: string): void {
     throw new Error('This draft cannot be queued: the company, contact, or suppression rules exclude it.');
   }
 
-  run(db, `UPDATE draft SET state = 'queued', scheduled_at = ?, updated_at = ? WHERE id = ?`, nextSlot(db), Date.now(), id);
+  try {
+    run(db, `UPDATE draft SET state = 'queued', scheduled_at = ?, updated_at = ? WHERE id = ?`, nextSlot(db), Date.now(), id);
+  } catch (err) {
+    // Requeueing a failed draft can collide with a newer active draft for the
+    // same person on the active-only unique index.
+    if (err instanceof Error && /UNIQUE constraint failed: draft\.contact_id/.test(err.message)) {
+      throw new Error('Another draft for this person is already active — skip one of them first.');
+    }
+    throw err;
+  }
   auditLog(db, { actor: 'operator', action: 'queueDraft', entity: 'draft', entityId: id });
   emitEvent('data:changed', { entity: 'draft', id });
   emitSendProgress(db);
 }
 
 export function skipDraft(db: Db, id: string): void {
-  run(db, `UPDATE draft SET state = 'skipped', scheduled_at = NULL, updated_at = ? WHERE id = ?`, Date.now(), id);
+  // State-guarded: skipping a 'sending' draft would race the in-flight Gmail
+  // call (whose failure path re-queues), and skipping a 'sent' one rewrites
+  // history. Neither is a skip.
+  const res = run(
+    db,
+    `UPDATE draft SET state = 'skipped', scheduled_at = NULL, updated_at = ? WHERE id = ? AND state IN ('draft','queued','failed')`,
+    Date.now(),
+    id,
+  );
+  if (Number(res.changes) === 0) {
+    const row = get<{ state: string }>(db, 'SELECT state FROM draft WHERE id = ?', id);
+    throw new Error(
+      row ? `A ${row.state} draft cannot be skipped.` : `Unknown draft: ${id}`,
+    );
+  }
   auditLog(db, { actor: 'operator', action: 'skipDraft', entity: 'draft', entityId: id });
   emitEvent('data:changed', { entity: 'draft', id });
   emitSendProgress(db);
@@ -277,6 +421,8 @@ interface SendCandidate {
   toEmail: string;
   subject: string;
   body: string;
+  /** The send this draft follows up on, when it is a bump. */
+  followUpOf: string | null;
 }
 
 function nextCandidate(db: Db, draftId?: string): SendCandidate | null {
@@ -285,7 +431,7 @@ function nextCandidate(db: Db, draftId?: string): SendCandidate | null {
   const row = get<SendCandidate>(
     db,
     `SELECT d.id AS draftId, d.company_id AS companyId, d.contact_id AS contactId,
-            c.email AS toEmail, d.subject, d.body
+            c.email AS toEmail, d.subject, d.body, d.follow_up_of AS followUpOf
        FROM draft d
        JOIN contact c ON c.id = d.contact_id
        JOIN company co ON co.id = d.company_id
@@ -297,10 +443,32 @@ function nextCandidate(db: Db, draftId?: string): SendCandidate | null {
   return row ?? null;
 }
 
+/**
+ * The Gmail surface sendOne/sendTestEmail actually touch. Injectable for tests
+ * (precedent: inbox.ts clientFactory) — the send path is the one place a test
+ * must never hit the real network, and it previously had zero direct coverage
+ * for exactly that reason. Production never swaps it.
+ */
+export interface SendGateway {
+  isConnected(): Promise<boolean>;
+  getAddress(): string | null;
+  sendMessage: typeof gmail.sendMessage;
+}
+
+let gateway: SendGateway = gmail;
+
+export function __setSendGatewayForTests(g: SendGateway | null): void {
+  gateway = g ?? gmail;
+}
+
 export type SendResult =
   | { ok: true; sendId: string }
-  /** `idle` means "nothing to do right now" as opposed to "this one failed". */
-  | { ok: false; reason: string; retryable: boolean; idle: boolean };
+  /**
+   * `idle` means "nothing to do right now" as opposed to "this one failed".
+   * `pause` means the failure is transport-wide (quota, auth) — the queue must
+   * stop rather than burn every remaining draft against a dead API.
+   */
+  | { ok: false; reason: string; retryable: boolean; idle: boolean; pause?: boolean };
 
 /**
  * Send exactly one message. Every caller goes through here so the ledger row,
@@ -316,15 +484,48 @@ export async function sendOne(db: Db, draftId?: string): Promise<SendResult> {
     return { ok: false, reason: 'Hourly limit reached.', retryable: true, idle: true };
   }
 
-  const candidate = nextCandidate(db, draftId);
-  if (!candidate) return { ok: false, reason: 'Nothing sendable in the queue.', retryable: false, idle: true };
+  // Deliverability circuit breaker: a run of bounces means the list quality
+  // or the account's standing has a problem, and every further send makes the
+  // sender reputation worse. Trip → pause; the operator investigates.
+  const recent = get<{ total: number; bounced: number }>(
+    db,
+    `SELECT count(*) AS total, COALESCE(sum(CASE WHEN outcome = 'bounced' THEN 1 ELSE 0 END), 0) AS bounced
+       FROM (SELECT outcome FROM send WHERE outcome IN ('sent','silent','replied','bounced')
+             ORDER BY created_at DESC LIMIT 50)`,
+  );
+  if (recent && recent.total >= 10 && recent.bounced >= 3 && recent.bounced / recent.total >= 0.1) {
+    return {
+      ok: false,
+      reason: `Bounce circuit breaker: ${recent.bounced} of the last ${recent.total} sends bounced. Verify your list before resuming.`,
+      retryable: false,
+      idle: false,
+      pause: true,
+    };
+  }
 
-  if (!(await gmail.isConnected())) {
+  // Connectivity first: after this point there are no awaits until the draft
+  // is claimed, so two overlapping calls cannot both pass the claim below.
+  if (!(await gateway.isConnected())) {
     return { ok: false, reason: 'Gmail is not connected.', retryable: true, idle: true };
   }
 
+  const candidate = nextCandidate(db, draftId);
+  if (!candidate) return { ok: false, reason: 'Nothing sendable in the queue.', retryable: false, idle: true };
+
+  // Atomic claim: only the caller that actually flips queued → sending owns
+  // this draft. The armed timer and an operator's Send-now can otherwise pick
+  // the same head-of-queue row and the same person gets the email twice.
   const sendId = ulid();
+  let claimed = false;
   tx(db, () => {
+    const res = run(
+      db,
+      `UPDATE draft SET state = 'sending', updated_at = ? WHERE id = ? AND state = 'queued'`,
+      Date.now(),
+      candidate.draftId,
+    );
+    if (Number(res.changes) === 0) return;
+    claimed = true;
     run(
       db,
       `INSERT INTO send (id, draft_id, company_id, contact_id, to_email, subject, body, outcome, created_at)
@@ -338,17 +539,48 @@ export async function sendOne(db: Db, draftId?: string): Promise<SendResult> {
       candidate.body,
       Date.now(),
     );
-    run(db, `UPDATE draft SET state = 'sending', updated_at = ? WHERE id = ?`, Date.now(), candidate.draftId);
   });
+  if (!claimed) {
+    return { ok: false, reason: 'Draft is already being sent.', retryable: true, idle: true };
+  }
 
   try {
+    // Send-time compliance backstop: however the draft was edited after
+    // generation, the message that leaves carries the opt-out line and the
+    // postal address whenever they are configured on.
+    const finalBody = ensureCompliantFooter(candidate.body, {
+      includeOptOutLine: sending.includeOptOutLine,
+      postalAddress: sending.postalAddress,
+    });
+    if (finalBody !== candidate.body) {
+      run(db, `UPDATE send SET body = ? WHERE id = ?`, finalBody, sendId);
+    }
+
+    // A follow-up threads onto the original send: same Gmail thread, proper
+    // In-Reply-To/References so the recipient's client stacks it correctly.
+    let threading: { threadId?: string; inReplyTo?: string; references?: string[] } = {};
+    if (candidate.followUpOf) {
+      const orig = get<{ gmail_thread_id: string | null; message_id: string | null }>(
+        db,
+        'SELECT gmail_thread_id, message_id FROM send WHERE id = ?',
+        candidate.followUpOf,
+      );
+      threading = {
+        threadId: orig?.gmail_thread_id ?? undefined,
+        inReplyTo: orig?.message_id ?? undefined,
+        references: orig?.message_id ? [orig.message_id] : undefined,
+      };
+    }
+
     // The send id is the X-RecruitAI-Send-Id header, which is how a bounce DSN
     // or a reply gets matched back to this exact row.
-    const result = await gmail.sendMessage({
+    const result = await gateway.sendMessage({
       to: candidate.toEmail,
       subject: candidate.subject,
-      body: candidate.body,
+      body: finalBody,
       sendId,
+      companyId: candidate.companyId,
+      ...threading,
     });
 
     tx(db, () => {
@@ -388,6 +620,12 @@ export async function sendOne(db: Db, draftId?: string): Promise<SendResult> {
     // message to Google. If that check fires, the address must never be tried
     // again — skip the draft rather than leaving it retryable.
     const suppressed = err instanceof SuppressedRecipientError;
+    // Quota, auth, and NETWORK failures are transport-wide, not the draft's
+    // fault: the draft goes back to the queue untouched and the caller pauses
+    // the run. Without the offline leg, a dropped Wi-Fi connection burned the
+    // whole queue to 'failed' at one draft per 10-second tick.
+    const offline = /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ENETUNREACH|network|fetch failed/i.test(message);
+    const transport = err instanceof GmailQuotaError || err instanceof GmailAuthError || offline;
 
     tx(db, () => {
       run(
@@ -400,18 +638,18 @@ export async function sendOne(db: Db, draftId?: string): Promise<SendResult> {
       run(
         db,
         `UPDATE draft SET state = ?, scheduled_at = NULL, updated_at = ? WHERE id = ?`,
-        suppressed ? 'skipped' : 'failed',
+        suppressed ? 'skipped' : transport ? 'queued' : 'failed',
         Date.now(),
         candidate.draftId,
       );
     });
 
-    if (/reauth|invalid_grant|unauthorized|\b401\b/i.test(message)) {
+    if (err instanceof GmailAuthError || /reauth|invalid_grant|unauthorized|\b401\b/i.test(message)) {
       emitEvent('gmail:needs-reauth', { address: gmail.getAddress() });
     }
     emitEvent('data:changed', { entity: 'draft', id: candidate.draftId });
     emitSendProgress(db);
-    return { ok: false, reason: message, retryable: !suppressed, idle: false };
+    return { ok: false, reason: message, retryable: !suppressed, idle: false, pause: transport };
   }
 }
 
@@ -424,6 +662,12 @@ function scheduleNextTick(db: Db, delayMs: number): void {
   emitSendProgress(db);
 }
 
+/** While the queue runs, pull the inbox on a timer so an unread "stop" reply
+ *  blocks that contact (see SENDABLE_PREDICATE) without waiting for a manual
+ *  sync. Failures are logged and never stall the queue. */
+const AUTO_SYNC_EVERY_MS = 15 * 60_000;
+let lastAutoInboxSyncAt = 0;
+
 async function tick(db: Db): Promise<void> {
   if (!sendingActive) return;
 
@@ -433,7 +677,29 @@ async function tick(db: Db): Promise<void> {
     return;
   }
 
+  if (Date.now() - lastAutoInboxSyncAt > AUTO_SYNC_EVERY_MS) {
+    lastAutoInboxSyncAt = Date.now();
+    try {
+      const n = await gmail.syncInbox();
+      if (typeof n === 'number' && n > 0) emitEvent('data:changed', { entity: 'inbound' });
+    } catch (err) {
+      appendLog('sender', 'warn', `Inbox auto-sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // The operator may have hit Pause during the sync await — re-check before
+  // committing a send, and again after it so a paused run never re-arms.
+  if (!sendingActive) return;
+
   const result = await sendOne(db);
+  if (!sendingActive) return;
+  if (!result.ok && result.pause) {
+    // Gmail said stop (quota or auth). Keep the queue intact and stand down —
+    // ticking on would burn every remaining draft against a dead API.
+    appendLog('sender', 'error', `Sending paused: ${result.reason}`);
+    pauseSending(db);
+    return;
+  }
   if (!result.ok && result.idle) {
     // Nothing to do right now. Stay armed so a newly-queued draft is picked up.
     scheduleNextTick(db, 60_000);
@@ -461,12 +727,16 @@ export function pauseSending(db: Db): void {
 /**
  * A 'pending' send is a message we started and never confirmed. We do not know
  * whether it left, so it is marked failed and surfaced — never auto-retried.
+ *
+ * Runs at startup only. The single-instance lock in src/main/index.ts means no
+ * other process can be mid-send, so every pending row is an orphan regardless
+ * of age — an age floor here just left crash-then-quick-relaunch drafts wedged
+ * in 'sending' until some later restart.
  */
 export function reconcileInterruptedSends(db: Db): number {
   const stale = all<{ id: string; draft_id: string }>(
     db,
-    `SELECT id, draft_id FROM send WHERE outcome = 'pending' AND created_at < ?`,
-    Date.now() - 10 * 60_000,
+    `SELECT id, draft_id FROM send WHERE outcome = 'pending'`,
   );
   for (const s of stale) {
     tx(db, () => {
@@ -539,10 +809,18 @@ export function markInbound(db: Db, id: string, action: 'positive' | 'negative' 
           run(db, `UPDATE send SET outcome = 'replied', outcome_at = ? WHERE id = ?`, Date.now(), row.send_id);
           run(db, `UPDATE contact SET status = 'rejected', updated_at = ? WHERE id = ?`, Date.now(), send.contact_id);
           run(db, `UPDATE company SET status = 'rejected', updated_at = ? WHERE id = ?`, Date.now(), send.company_id);
-          const domain = send.to_email.slice(send.to_email.indexOf('@') + 1);
-          addSuppressionRow(db, 'domain', domain, 'replied_no', 'Asked not to be contacted again');
-          // Anything still queued for this domain must not go out.
-          cancelQueuedForDomain(db, domain);
+          const address = send.to_email.trim().toLowerCase();
+          const domain = address.slice(address.indexOf('@') + 1);
+          if (isFreemailDomain(domain)) {
+            // One founder on gmail.com saying "no" must not suppress every
+            // gmail.com contact in the pipeline — suppress the address only.
+            addSuppressionRow(db, 'email', address, 'replied_no', 'Asked not to be contacted again');
+            cancelQueuedForEmail(db, address);
+          } else {
+            addSuppressionRow(db, 'domain', domain, 'replied_no', 'Asked not to be contacted again');
+            // Anything still queued for this domain must not go out.
+            cancelQueuedForDomain(db, domain);
+          }
         }
         break;
       }
@@ -566,6 +844,9 @@ export function markInbound(db: Db, id: string, action: 'positive' | 'negative' 
             Date.now(),
             address,
           );
+          // Queued drafts to a dead address can never send (the predicate
+          // excludes them) — pull them so the Queue stops showing zombies.
+          cancelQueuedForEmail(db, address);
         }
         break;
       }
@@ -580,6 +861,16 @@ export function markInbound(db: Db, id: string, action: 'positive' | 'negative' 
 
   if (send) recomputeCompany(db, send.company_id);
   emitEvent('data:changed', { entity: 'inbound', id });
+  // The transaction above may have rejected the company, suppressed an
+  // identity, and skipped queued drafts — every one of those surfaces reads
+  // stale without its own event (the Review list is staleTime-Infinity).
+  // Not gated on `send`: an UNMATCHED bounce still suppresses the recipient
+  // address and flips contacts.
+  if (action === 'negative' || action === 'bounce') {
+    emitEvent('data:changed', { entity: 'company' });
+    emitEvent('data:changed', { entity: 'draft' });
+    emitEvent('data:changed', { entity: 'suppression' });
+  }
   emitSendProgress(db);
 }
 
@@ -594,17 +885,35 @@ function cancelQueuedForDomain(db: Db, domain: string): void {
   );
 }
 
-export function addSuppressionRow(db: Db, kind: string, value: string, reason: string, note: string | null): void {
+function cancelQueuedForEmail(db: Db, address: string): void {
   run(
     db,
-    `INSERT INTO suppression (kind, value, reason, note, created_at) VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(kind, value) DO NOTHING`,
-    kind,
-    value.trim().toLowerCase(),
-    reason,
-    note,
+    `UPDATE draft SET state = 'skipped', scheduled_at = NULL, updated_at = ?
+      WHERE state IN ('draft','queued')
+        AND contact_id IN (SELECT id FROM contact WHERE lower(email) = lower(?))`,
     Date.now(),
+    address,
   );
+}
+
+export function addSuppressionRow(db: Db, kind: string, value: string, reason: string, note: string | null): void {
+  // Company values are canonicalised (ULID / domain / normName), preferring
+  // the reading that matches a real company — "Node.js" is a NAME whose
+  // norm is 'node js', not the domain 'node.js'. A pre-emptive entry that
+  // matches nothing yet stores BOTH readings. Everything else lowercases.
+  const values = kind === 'company' ? companySuppressionValues(db, value) : [value.trim().toLowerCase()];
+  for (const stored of values) {
+    run(
+      db,
+      `INSERT INTO suppression (kind, value, reason, note, created_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(kind, value) DO NOTHING`,
+      kind,
+      stored,
+      reason,
+      note,
+      Date.now(),
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -612,12 +921,15 @@ export function addSuppressionRow(db: Db, kind: string, value: string, reason: s
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function registerOutreachIpc(): void {
-  ipcMain.handle('listDrafts', async (_e, state?: string) => listDrafts(getDb(), state || undefined));
+  handle('listDrafts', async (state?: string) => listDrafts(getDb(), state));
 
-  ipcMain.handle('generateDraft', async (_e, companyId: string, contactId?: string) => {
+  handle('generateDraft', async (companyId: string, contactId?: string, force?: boolean) => {
     const db = getDb();
     try {
-      const generated = await generateDraftFor(db, companyId, contactId || undefined, { force: true });
+      // force is ONLY the explicit Regenerate button. A plain compose keeps
+      // the guards live: edited drafts survive, and an already-emailed person
+      // routes to the follow-up flow instead of a second cold pitch.
+      const generated = await generateDraftFor(db, companyId, contactId, { force: force === true });
       emitEvent('data:changed', { entity: 'draft', id: generated.id });
       return readDraft(db, generated.id);
     } catch (err) {
@@ -626,47 +938,75 @@ export function registerOutreachIpc(): void {
     }
   });
 
-  ipcMain.handle('patchDraft', async (_e, id: string, patch: { subject?: string; body?: string }) =>
-    patchDraft(getDb(), id, patch ?? {}),
+  handle('patchDraft', async (id: string, patch: { subject?: string; body?: string }) =>
+    patchDraft(getDb(), id, patch),
   );
 
-  ipcMain.handle('queueDraft', async (_e, id: string) => {
+  handle('queueDraft', async (id: string) => {
     queueDraft(getDb(), id);
   });
 
-  ipcMain.handle('skipDraft', async (_e, id: string) => {
+  handle('unqueueDraft', async (id: string) => {
+    unqueueDraft(getDb(), id);
+  });
+
+  handle('skipDraft', async (id: string) => {
     skipDraft(getDb(), id);
   });
 
-  ipcMain.handle('sendNow', async (_e, id: string) => {
+  handle('sendTestEmail', async (id: string) => sendTestEmail(getDb(), id));
+
+  handle('listSent', async () => listSent(getDb()));
+
+  handle('getPerformance', async () => getPerformance(getDb()));
+
+  handle('generateFollowUp', async (sendId: string) => {
+    const db = getDb();
+    try {
+      const generated = await followUpDraftFor(db, sendId);
+      emitEvent('data:changed', { entity: 'draft', id: generated.id });
+      return readDraft(db, generated.id);
+    } catch (err) {
+      if (err instanceof DraftNotPossible) throw new Error(err.message);
+      throw err;
+    }
+  });
+
+  handle('sendNow', async (id: string) => {
     const db = getDb();
     const state = get<{ state: string }>(db, 'SELECT state FROM draft WHERE id = ?', id);
     if (!state) throw new Error(`Unknown draft: ${id}`);
+    if (state.state === 'sent' || state.state === 'sending' || state.state === 'skipped') {
+      throw new Error(`This draft is ${state.state} — nothing to send.`);
+    }
     if (state.state === 'draft' || state.state === 'failed') queueDraft(db, id);
 
     const result = await sendOne(db, id);
-    if (!result.ok) throw new Error(result.reason);
+    if (!result.ok) {
+      // A quota/auth/offline error discovered via Send-now must stop the armed
+      // timer too — otherwise it rediscovers the same error one tick later.
+      if (result.pause) pauseSending(db);
+      throw new Error(result.reason);
+    }
   });
 
-  ipcMain.handle('getSendStats', async () => getSendStats(getDb()));
+  handle('getSendStats', async () => getSendStats(getDb()));
 
-  ipcMain.handle('startSending', async () => {
+  handle('startSending', async () => {
     startSending(getDb());
   });
 
-  ipcMain.handle('pauseSending', async () => {
+  handle('pauseSending', async () => {
     pauseSending(getDb());
   });
 
-  ipcMain.handle('listInbound', async (_e, handled?: boolean) =>
-    listInbound(getDb(), typeof handled === 'boolean' ? handled : undefined),
-  );
+  handle('listInbound', async (handled?: boolean) => listInbound(getDb(), handled));
 
-  ipcMain.handle('markInbound', async (_e, id: string, action: 'positive' | 'negative' | 'bounce' | 'ignore') => {
+  handle('markInbound', async (id: string, action: 'positive' | 'negative' | 'bounce' | 'ignore') => {
     markInbound(getDb(), id, action);
   });
 
-  ipcMain.handle('syncInbox', async () => {
+  handle('syncInbox', async () => {
     const count = await gmail.syncInbox();
     emitEvent('data:changed', { entity: 'inbound' });
     return typeof count === 'number' ? count : 0;

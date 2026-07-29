@@ -181,11 +181,16 @@ export async function fetchSmartRecruiters(token: string): Promise<SourceResult<
 
   // Cap at 10 pages (1000 postings) — beyond that we're looking at an enterprise
   // that is almost certainly out of ICP anyway.
+  let partial = false;
   for (let page = 0; page < 10; page++) {
     const url = `${base}?limit=100&offset=${offset}`;
     const res = await httpRequest(url);
     last = res;
-    if (!res.ok) break;
+    if (!res.ok) {
+      // A failed page 2+ means `all` is a prefix of the board, not the board.
+      partial = all.length > 0;
+      break;
+    }
     if (!firstBody) firstBody = res.body;
 
     const parsed = safeParse<{ content?: SrPosting[]; totalFound?: number }>(res.body);
@@ -214,6 +219,7 @@ export async function fetchSmartRecruiters(token: string): Promise<SourceResult<
     jobs,
     fetchedAt: new Date().toISOString(),
     rawBody: firstBody,
+    partial,
   });
 }
 
@@ -257,64 +263,11 @@ export async function fetchWorkable(token: string): Promise<SourceResult<AtsBoar
   return ok(url, res, { platform: 'workable', token, jobs, fetchedAt: res.fetchedAt, rawBody: res.body });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Workday — POST, offset-paginated. Mostly large enterprises, so usually out of
-// ICP, but kept for completeness.
-// ─────────────────────────────────────────────────────────────────────────────
-
-interface WdPosting {
-  title: string;
-  externalPath: string;
-  locationsText?: string;
-  postedOn?: string;
-  bulletFields?: string[];
-}
-
-export async function fetchWorkday(
-  tenant: string,
-  site: string,
-  wdNum = 5,
-): Promise<SourceResult<AtsBoard>> {
-  const base = `https://${tenant}.wd${wdNum}.myworkdayjobs.com/wday/cxs/${tenant}/${site}/jobs`;
-  const all: WdPosting[] = [];
-  let firstBody = '';
-  let last: HttpResponse | null = null;
-
-  for (let page = 0; page < 5; page++) {
-    const res = await httpRequest(base, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ appliedFacets: {}, limit: 20, offset: page * 20, searchText: '' }),
-    });
-    last = res;
-    if (!res.ok) break;
-    if (!firstBody) firstBody = res.body;
-
-    const parsed = safeParse<{ jobPostings?: WdPosting[]; total?: number }>(res.body);
-    const posts = parsed?.jobPostings ?? [];
-    all.push(...posts);
-    if (posts.length < 20) break;
-  }
-
-  if (!last?.ok && all.length === 0) return fail(last ?? emptyRes(base), base);
-
-  const jobs: DiscoveredJob[] = all.map((p) => ({
-    externalId: p.bulletFields?.[0] ?? p.externalPath,
-    title: p.title,
-    location: p.locationsText ?? null,
-    url: `https://${tenant}.wd${wdNum}.myworkdayjobs.com/en-US/${site}${p.externalPath}`,
-    publishedAt: null,
-    updatedAt: p.postedOn ?? null,
-  }));
-
-  return ok(base, last ?? emptyRes(base), {
-    platform: 'workday',
-    token: tenant,
-    jobs,
-    fetchedAt: new Date().toISOString(),
-    rawBody: firstBody,
-  });
-}
+// Workday has no adapter on purpose: its API needs (tenant, site, wd-N) and
+// nothing in the pipeline can discover those — the careers-crawl records only
+// a bare token. A fetcher existed here for two audits while being provably
+// unreachable; if Workday support lands, it starts from tenant+site discovery,
+// not from a fetcher (see git history for the removed implementation).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dispatcher
@@ -355,6 +308,72 @@ export class AllPlatformsBlockedError extends Error {
   }
 }
 
+/** Who the caller believes it is probing for, so an obviously wrong board can
+ *  be turned away. Both fields optional — omitted means "no opinion". */
+export interface ProbeExpectation {
+  name?: string | null;
+  domain?: string | null;
+}
+
+/**
+ * Company display name embedded in a raw board payload, when the platform
+ * publishes one (Workable's top-level `name`; some Greenhouse payloads carry
+ * `company.name`). Most platforms expose nothing, and that is fine — the
+ * collision guard simply passes when there is no signal to check.
+ */
+function boardCompanyName(rawBody: string | null | undefined): string | null {
+  if (!rawBody) return null;
+  const parsed = safeParse<{ name?: unknown; company?: { name?: unknown } | null }>(rawBody);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const name =
+    (parsed.company && typeof parsed.company === 'object' ? parsed.company.name : undefined) ?? parsed.name;
+  return typeof name === 'string' && name.trim().length > 0 ? name : null;
+}
+
+const squash = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+const nameTokens = (s: string): Set<string> =>
+  new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3));
+
+/**
+ * Token-collision sanity guard.
+ *
+ * A guessed token can resolve an unrelated company's board — 'atlas', 'linear'
+ * and bare first DNS labels all collide with real customers of these
+ * platforms. When the caller says who it expected and the payload names who
+ * actually answered, an obvious mismatch is rejected.
+ *
+ * The tradeoff is deliberately tilted toward accepting: a false rejection
+ * silently loses a real board (and nothing downstream will ever look again),
+ * while a false accept produces visible garbage an operator can suppress. So
+ * the guard passes whenever the payload exposes no name, whenever the probed
+ * token itself appears in the expected name/domain, and whenever any ≥3-char
+ * token is shared between the board's name and the expected identity — it
+ * only exists to catch the obvious collisions.
+ */
+function boardMatchesExpectation(board: AtsBoard, expect: ProbeExpectation): boolean {
+  const boardName = boardCompanyName(board.rawBody);
+  if (!boardName) return true;
+
+  const expected = [expect.name ?? '', expect.domain ?? ''].join(' ').trim();
+  const expectedSquashed = squash(expected);
+  if (!expectedSquashed) return true;
+
+  const token = squash(board.token);
+  if (token.length >= 3 && expectedSquashed.includes(token)) return true;
+
+  const expectedTokens = nameTokens(expected);
+  // No usable expected token (e.g. company "X1", domain x1.com — everything
+  // shorter than the 3-char floor): the guard must abstain, not reject. A
+  // false rejection silently loses a real board forever.
+  if (expectedTokens.size === 0) return true;
+
+  for (const t of nameTokens(boardName)) {
+    if (expectedTokens.has(t)) return true;
+  }
+  return false;
+}
+
 /**
  * Try each platform until one returns a board with jobs.
  *
@@ -367,15 +386,29 @@ export class AllPlatformsBlockedError extends Error {
  * 429 as a global stop threw away the whole sweep, so a blocked platform is
  * simply dropped for the rest of the run. We still never retry or evade it —
  * we just stop asking that host, and keep talking to the ones that are happy.
+ *
+ * When `expect` is provided, a board that names an obviously different company
+ * is skipped (see boardMatchesExpectation). Omitting it keeps the old
+ * behaviour exactly — tests and the smoke script probe bare tokens.
  */
-export async function probeAts(token: string, blocked: BlockedPlatforms = new Set()): Promise<AtsBoard | null> {
+export async function probeAts(
+  token: string,
+  blocked: BlockedPlatforms = new Set(),
+  expect?: ProbeExpectation,
+): Promise<AtsBoard | null> {
   const available = PROBE_ORDER.filter((p) => !blocked.has(p));
   if (available.length === 0) throw new AllPlatformsBlockedError();
 
   for (const platform of available) {
     const result = await ATS_FETCHERS[platform](token);
-    if (result.ok && result.data && result.data.jobs.length > 0) return result.data;
+    // A 429/403 marks the platform blocked even when data came back with it:
+    // SmartRecruiters paginates, so page 1 can succeed and page 2 rate-limit.
+    // The postings already fetched are real and are kept.
     if (result.httpStatus === 429 || result.httpStatus === 403) blocked.add(platform);
+    if (result.ok && result.data && result.data.jobs.length > 0) {
+      if (expect && !boardMatchesExpectation(result.data, expect)) continue;
+      return result.data;
+    }
   }
   return null;
 }
