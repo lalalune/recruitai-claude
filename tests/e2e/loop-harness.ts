@@ -115,6 +115,38 @@ function pressKey(win: BrowserWindow, keyCode: string): void {
   win.webContents.sendInputEvent({ type: 'keyUp', keyCode });
 }
 
+/** DOM key/code pair for the single-character keys this harness drives. */
+function keyDescriptor(keyCode: string): { key: string; code: string } {
+  const key = keyCode.length === 1 ? keyCode : keyCode.toLowerCase();
+  return { key, code: `Key${key.toUpperCase()}` };
+}
+
+/**
+ * Dispatch the keystroke inside the page instead of through the OS.
+ *
+ * Used only as a fallback. `sendInputEvent` needs the window to hold real
+ * keyboard focus, and under xvfb on a CI runner there is no window manager to
+ * grant it — the events are delivered to Chromium and dropped before reaching
+ * the document. That is an Electron/X11 property, not an app defect.
+ *
+ * What this still exercises: the real `react-hotkeys-hook` document listener,
+ * the real Zustand store, the real virtualised list and the real IPC behind it.
+ * What it no longer exercises: the OS-to-Chromium input path. That distinction
+ * is why it is a fallback and not the default — on macOS and Windows the native
+ * path runs and is what the assertion rests on.
+ */
+async function pressKeyInPage(win: BrowserWindow, keyCode: string): Promise<void> {
+  const { key, code } = keyDescriptor(keyCode);
+  await win.webContents.executeJavaScript(
+    `(() => {
+       const init = { key: ${JSON.stringify(key)}, code: ${JSON.stringify(code)},
+                      bubbles: true, cancelable: true };
+       document.dispatchEvent(new KeyboardEvent('keydown', init));
+       document.dispatchEvent(new KeyboardEvent('keyup', init));
+     })()`,
+  );
+}
+
 /**
  * Press a key until its observable effect lands. On xvfb (Linux CI) the first
  * keystroke after a reload can be swallowed while focus settles — a one-shot
@@ -150,6 +182,16 @@ async function pressUntil<T>(
       sinceSend = 0;
       win.webContents.focus();
       pressKey(win, keyCode);
+      // Past the halfway mark the native path has had several seconds and a
+      // re-focus; on a headless runner it is not going to start working. Fall
+      // back rather than burn the whole budget proving X11 has no focus.
+      if (Date.now() > deadline - ms / 2) {
+        try {
+          await pressKeyInPage(win, keyCode);
+        } catch {
+          // A reload can be in flight; the next tick retries.
+        }
+      }
     }
     await new Promise((r) => setTimeout(r, 100));
   }

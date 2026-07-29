@@ -76,11 +76,11 @@ export function useSettings() {
 function mergeSettings(prev: SettingsShape, patch: SettingsPatch): SettingsShape {
   return {
     ...prev,
-    icp: { ...prev.icp, ...(patch.icp ?? {}) },
-    sending: { ...prev.sending, ...(patch.sending ?? {}) },
-    crawl: { ...prev.crawl, ...(patch.crawl ?? {}) },
+    icp: { ...prev.icp, ...patch.icp },
+    sending: { ...prev.sending, ...patch.sending },
+    crawl: { ...prev.crawl, ...patch.crawl },
     spendCapUsd: patch.spendCapUsd ?? prev.spendCapUsd,
-    templates: { ...prev.templates, ...(patch.templates ?? {}) },
+    templates: { ...prev.templates, ...patch.templates },
   };
 }
 

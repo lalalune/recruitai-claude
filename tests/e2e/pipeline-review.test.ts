@@ -21,7 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
-import { initDb, closeDb, all, get, run, type Db } from '../../src/main/db/index.js';
+import { initDb, closeDb, all, get, type Db } from '../../src/main/db/index.js';
 import {
   ingestCareersCrawl,
   upsertCompany,

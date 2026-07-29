@@ -123,7 +123,7 @@ test('fetchGreenhouse decodes entity-escaped HTML into plain description text', 
 });
 
 test('fetchGreenhouse omits content when not requested', async () => {
-  const withoutContent = { jobs: greenhouseFixture.jobs.map(({ content, ...rest }) => rest) };
+  const withoutContent = { jobs: greenhouseFixture.jobs.map(({ content: _content, ...rest }) => rest) };
   await serving(withoutContent, async (requested) => {
     const result = await fetchGreenhouse('anthropic');
     assert.equal(requested[0], 'https://boards-api.greenhouse.io/v1/boards/anthropic/jobs');

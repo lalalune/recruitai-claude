@@ -113,7 +113,8 @@ export function createEntityDebouncer(
       p.timer = setTimeout(() => fire(entity), Math.max(0, Math.min(wait, p.deadline - now)));
     },
     flushAll() {
-      for (const entity of [...pending.keys()]) fire(entity);
+      const entities = Array.from(pending.keys()); // fire() mutates pending
+      for (const entity of entities) fire(entity);
     },
     dispose() {
       for (const p of pending.values()) if (p.timer) clearTimeout(p.timer);

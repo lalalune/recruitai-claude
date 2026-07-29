@@ -89,7 +89,6 @@ export {
   type DeliveryStatusRecipient,
 } from './mime.js';
 
-import { isConnected, getAddress, needsReauth } from './oauth.js';
 
 export interface GmailStatus {
   connected: boolean;

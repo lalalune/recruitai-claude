@@ -9,7 +9,7 @@
  * `estimatedFee = compMidpoint * 0.30` computable without paying anyone.
  */
 
-import { httpRequest, httpJson, type HttpResponse } from '../util/http.js';
+import { httpRequest, type HttpResponse } from '../util/http.js';
 import type { AtsBoard, AtsPlatform, DiscoveredJob, SourceResult } from '../../shared/types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────

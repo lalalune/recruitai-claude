@@ -89,7 +89,8 @@ class FakeEmitter {
   }
   emit(event: string, ...args: unknown[]): boolean {
     const list = this.listeners.get(event) ?? [];
-    for (const fn of [...list]) fn(...args);
+    const snapshot = Array.from(list); // listeners may unsubscribe mid-emit
+    for (const fn of snapshot) fn(...args);
     return list.length > 0;
   }
 }

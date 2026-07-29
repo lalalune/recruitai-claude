@@ -9,7 +9,7 @@
  * can both poll the same table without a lock, a lease column, or a race.
  */
 
-import { getDb, all, get, run, type Db } from '../db/index.js';
+import { all, get, run, type Db } from '../db/index.js';
 
 export interface TaskRow {
   id: number;

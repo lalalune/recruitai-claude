@@ -288,7 +288,7 @@ export async function mapLimit<T, R>(
   opts: { jitterMs?: number; onProgress?: (done: number, total: number) => void } = {},
 ): Promise<(R | null)[]> {
   const { jitterMs = 120, onProgress } = opts;
-  const results = new Array<R | null>(items.length).fill(null);
+  const results: (R | null)[] = Array.from({ length: items.length }, () => null);
   let cursor = 0;
   let done = 0;
 

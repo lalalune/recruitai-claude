@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { initDb, closeDb, getDb, get, all, run, ulid, type Db } from '../../src/main/db/index.js';
+import { initDb, closeDb, getDb, get, run, ulid, type Db } from '../../src/main/db/index.js';
 import { registerIpc } from '../../src/main/ipc/index.js';
 import { upsertCompany } from '../../src/main/pipeline/ingest.js';
 import { canonicalCompanyValue } from '../../src/main/pipeline/suppression.js';

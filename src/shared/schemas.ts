@@ -28,6 +28,7 @@ import { z } from 'zod';
 // Primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
+// oxlint-disable-next-line no-control-regex -- matching control chars is the point
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
 /** ULID-ish: what `ulid()` in src/main/db/index.ts emits, plus room for imports. */

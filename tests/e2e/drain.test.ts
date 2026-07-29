@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { openDb, all, get, run, type Db } from '../../src/main/db/index.js';
+import { openDb, get, run, type Db } from '../../src/main/db/index.js';
 import { enqueue, claim, complete, fail, requeueStale, taskCounts } from '../../src/main/pipeline/tasks.js';
 
 let dir: string;

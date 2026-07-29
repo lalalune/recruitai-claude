@@ -8,7 +8,7 @@
  */
 import path from 'node:path';
 import fs from 'node:fs';
-import { initDb, getDb, all, get } from '../src/main/db/index.js';
+import { initDb, getDb, all } from '../src/main/db/index.js';
 import { fetchYcCompanies, filterYcIcp, candidateTokens } from '../src/main/sources/seeds.js';
 import { probeAts, type BlockedPlatforms } from '../src/main/sources/ats.js';
 import { scoreCompany, DEFAULT_ICP } from '../src/shared/score.js';

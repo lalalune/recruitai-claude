@@ -2,7 +2,7 @@ name: test
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
 
 jobs:
@@ -43,6 +43,8 @@ jobs:
           key: electron-${{ runner.os }}-${{ hashFiles('bun.lock') }}
 
       - run: bun install --frozen-lockfile
+
+      - run: bun run lint
 
       - run: bun run typecheck
 
