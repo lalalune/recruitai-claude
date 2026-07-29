@@ -361,6 +361,37 @@ export function sentThisHour(db: Db): number {
   return row?.n ?? 0;
 }
 
+/**
+ * Cap accounting for the CLAIM decision: completed sends PLUS in-flight
+ * pending claims. sentToday counts only completed sends (sent_at is set on
+ * success), so a concurrent claim was invisible to it and two callers could
+ * both take the day's last slot.
+ */
+function committedToday(db: Db): number {
+  const row = get<{ n: number }>(
+    db,
+    `SELECT count(*) AS n FROM send
+      WHERE (sent_at >= ? AND outcome != 'failed')
+         OR (outcome = 'pending' AND created_at >= ?)`,
+    startOfLocalDay(),
+    startOfLocalDay(),
+  );
+  return row?.n ?? 0;
+}
+
+function committedThisHour(db: Db): number {
+  const cutoff = Date.now() - 3_600_000;
+  const row = get<{ n: number }>(
+    db,
+    `SELECT count(*) AS n FROM send
+      WHERE (sent_at >= ? AND outcome != 'failed')
+         OR (outcome = 'pending' AND created_at >= ?)`,
+    cutoff,
+    cutoff,
+  );
+  return row?.n ?? 0;
+}
+
 export function queuedCount(db: Db): number {
   const row = get<{ n: number }>(
     db,
@@ -517,7 +548,16 @@ export async function sendOne(db: Db, draftId?: string): Promise<SendResult> {
   // the same head-of-queue row and the same person gets the email twice.
   const sendId = ulid();
   let claimed = false;
+  let capBlocked = false;
   tx(db, () => {
+    // Re-check the caps INSIDE the claim transaction, counting in-flight
+    // pending claims: the top-of-function checks happened before an await,
+    // and a concurrent claim is invisible to sentToday (which only counts
+    // completed sends) — two callers could otherwise take the day's last slot.
+    if (committedToday(db) >= sending.perDay || committedThisHour(db) >= sending.perHour) {
+      capBlocked = true;
+      return;
+    }
     const res = run(
       db,
       `UPDATE draft SET state = 'sending', updated_at = ? WHERE id = ? AND state = 'queued'`,
@@ -540,6 +580,9 @@ export async function sendOne(db: Db, draftId?: string): Promise<SendResult> {
       Date.now(),
     );
   });
+  if (capBlocked) {
+    return { ok: false, reason: 'Sending limit reached.', retryable: true, idle: true };
+  }
   if (!claimed) {
     return { ok: false, reason: 'Draft is already being sent.', retryable: true, idle: true };
   }

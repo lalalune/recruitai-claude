@@ -190,13 +190,43 @@ async function main(): Promise<void> {
     return row?.id;
   });
   ok('approval flowed through the task queue into a real draft');
-  probe.close();
 
   // And the draft is visible to the UI layer through the same IPC the
   // Outreach screen uses.
   const drafts = (await win.webContents.executeJavaScript(`window.api.listDrafts('draft')`)) as unknown[];
   if (drafts.length >= 1) ok(`listDrafts sees ${drafts.length} draft(s) over live IPC`);
   else fail('listDrafts returned nothing for the generated draft');
+
+  // Continue the loop into Outreach: click the sidebar nav (a real DOM click
+  // on the real button), see the draft in the Drafts tab, queue it with the
+  // real ⌘/Ctrl+Enter hotkey, and verify the queue state in the database.
+  await win.webContents.executeJavaScript(
+    `[...document.querySelectorAll('nav button')].find((b) => b.textContent.includes('Outreach'))?.click()`,
+  );
+  await waitFor('Outreach shows the draft', 10_000, async () => {
+    const text = (await win.webContents.executeJavaScript(`document.body.innerText`)) as string;
+    return text.includes(target) || undefined;
+  });
+  ok('Outreach Drafts tab lists the generated draft');
+
+  const modifier = process.platform === 'darwin' ? 'meta' : 'control';
+  win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter', modifiers: [modifier] });
+  win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: [modifier] });
+
+  await waitFor('the draft reaches the queue', 10_000, () => {
+    const row = probe
+      .prepare(
+        `SELECT d.state FROM draft d JOIN company co ON co.id = d.company_id WHERE co.name = ?`,
+      )
+      .get(target) as { state: string } | undefined;
+    return row?.state === 'queued' || undefined;
+  });
+  ok('⌘/Ctrl+Enter queued the draft — state and schedule confirmed in the database');
+
+  const sendStats = (await win.webContents.executeJavaScript(`window.api.getSendStats()`)) as { queued: number };
+  if (sendStats.queued >= 1) ok(`send stats report ${sendStats.queued} queued over live IPC`);
+  else fail(`send stats report ${sendStats.queued} queued — expected at least 1`);
+  probe.close();
 
   server.close();
   fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
