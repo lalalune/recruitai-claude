@@ -286,8 +286,12 @@ describe('scoring: derived company columns', () => {
     seedReq(db, id, { externalId: 'r1', title: 'Backend Engineer', publishedDaysAgo: 60, compMin: 250_000, compMax: 250_000 });
 
     assert.equal(isSuppressed(db, id, 'client.test'), false);
-    // Stored uppercase on purpose: the lookup is case-insensitive by design.
-    run(db, `INSERT INTO suppression (kind, value, reason) VALUES ('domain', 'CLIENT.TEST', 'existing_client')`);
+    // Stored lowercase: the canonical-value invariant (intake lowercases;
+    // migration v3 repaired legacy rows) is what lets every barrier SEEK the
+    // UNIQUE(kind, value) index instead of scanning the kind. The lookup side
+    // still case-folds its own inputs (domain params go through lower()).
+    run(db, `INSERT INTO suppression (kind, value, reason) VALUES ('domain', 'client.test', 'existing_client')`);
+    assert.equal(isSuppressed(db, id, 'CLIENT.TEST'), true, 'the query lower()s its own parameter');
     assert.equal(isSuppressed(db, id, 'client.test'), true);
     assert.equal(isSuppressed(db, 'C_OTHER', 'somewhere-else.test'), false);
 

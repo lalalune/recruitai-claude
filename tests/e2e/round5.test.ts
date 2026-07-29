@@ -305,12 +305,14 @@ describe('round5 migration v3', () => {
   test('round5 upgrading a v2 database lowercases legacy suppression values and repairs name_norm', () => {
     const file = path.join(tmpRoot, 'v2-legacy.db');
     const v2 = openDb(file);
-    // Rewind to v2: drop everything v3 and v4 added, then plant legacy-shaped
-    // rows — an uppercase suppression value (pre-invariant) and the name_norm
-    // the old ASCII normName produced for a CJK company (empty string).
+    // Rewind to v2: drop everything v3, v4 and v5 added, then plant
+    // legacy-shaped rows — an uppercase suppression value (pre-invariant) and
+    // the name_norm the old ASCII normName produced for a CJK company (empty
+    // string). Every new migration that creates an index must be listed here.
     v2.exec(`DROP INDEX send_contact; DROP INDEX inbound_unhandled; DROP INDEX send_to_email;
              DROP INDEX field_observation_evidence; DROP INDEX api_call_spend;
-             DROP INDEX raw_source_url;`);
+             DROP INDEX raw_source_url;
+             DROP INDEX contact_email_domain; DROP INDEX fo_email_domain;`);
     run(
       v2,
       `INSERT INTO suppression (kind, value, reason, created_at) VALUES ('domain', 'ACME.EXAMPLE', 'manual', ?)`,

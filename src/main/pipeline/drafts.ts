@@ -95,6 +95,19 @@ export function renderSubject(facts: DraftFacts): string {
  * from a model, and nothing is invented — if a fact is missing, the sentence
  * that would have used it is dropped rather than softened into a guess.
  */
+/**
+ * Age of a requisition as a phrase, or null when the number would undercut the
+ * message. A req first seen today reports 0 days — saying "open 0 days" to a
+ * hiring manager reads as broken software, and "1 days" reads as careless.
+ * Below a week there is no staleness story to tell, so the clause is dropped
+ * rather than fudged.
+ */
+export function daysOpenPhrase(days: number | null | undefined): string | null {
+  if (days == null || !Number.isFinite(days) || days < 7) return null;
+  const n = Math.floor(days);
+  return `open ${n} day${n === 1 ? '' : 's'}`;
+}
+
 export function renderBody(facts: DraftFacts): string {
   const lines: string[] = [];
   const recruiter = recruiterClause(facts);
@@ -148,10 +161,18 @@ export function renderBody(facts: DraftFacts): string {
           `${facts.staleReqCount > 0 ? `, and ${facts.staleReqCount} have been live longer than 45 days` : ''}.`,
       );
       lines.push('');
-      lines.push(
-        `The ${facts.reqTitle} req is the one I'd start with — it's been open ${facts.reqDaysOpen} days` +
-          `${facts.reqLocation ? ` and it's a ${facts.reqLocation} search` : ''}, which is the profile my desk covers.`,
-      );
+      {
+        const age = daysOpenPhrase(facts.reqDaysOpen);
+        const where = facts.reqLocation ? `a ${facts.reqLocation} search` : null;
+        const detail = [age ? `it's been ${age}` : null, where ? `it's ${where}` : null]
+          .filter(Boolean)
+          .join(' and ');
+        lines.push(
+          `The ${facts.reqTitle} req is the one I'd start with` +
+            (detail ? ` — ${detail}` : '') +
+            (where ? ', which is the profile my desk covers.' : '.'),
+        );
+      }
       lines.push('');
       lines.push(
         `I work with a handful of Bay Area teams on exactly these searches. Contingency, ${fee ? `roughly ${fee} across the roles I'd realistically fill` : 'standard contingency terms'}, ` +
@@ -165,11 +186,14 @@ export function renderBody(facts: DraftFacts): string {
         `I know a company your size almost certainly has a preferred supplier list, so I'll keep this short.`,
       );
       lines.push('');
-      lines.push(
-        `Your ${facts.reqTitle} req has been open ${facts.reqDaysOpen} days` +
-          `${facts.reqLocation ? ` in ${facts.reqLocation}` : ''}. I run a Bay Area technical desk and I'd like to be considered for the overflow ` +
-          `on searches like that one — either through your existing agency process or as a one-off on this req.`,
-      );
+      {
+        const age = daysOpenPhrase(facts.reqDaysOpen);
+        lines.push(
+          `Your ${facts.reqTitle} req${age ? ` has been ${age}` : ' is open'}` +
+            `${facts.reqLocation ? ` in ${facts.reqLocation}` : ''}. I run a Bay Area technical desk and I'd like to be considered for the overflow ` +
+            `on searches like that one — either through your existing agency process or as a one-off on this req.`,
+        );
+      }
       break;
     }
   }

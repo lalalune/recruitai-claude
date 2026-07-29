@@ -53,10 +53,22 @@ function serveRenderer(): Promise<http.Server> {
 
 async function waitFor<T>(what: string, ms: number, poll: () => T | null | undefined | Promise<T | null | undefined>): Promise<T> {
   const deadline = Date.now() + ms;
+  let lastErr: unknown = null;
   for (;;) {
-    const got = await poll();
-    if (got !== null && got !== undefined) return got;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    // A throwing poll is "not ready yet", not a verdict: executeJavaScript
+    // rejects while a reload is in flight, and the WAL probe can hit
+    // SQLITE_BUSY during a checkpoint. Only past the deadline does the last
+    // error become the failure.
+    try {
+      const got = await poll();
+      if (got !== null && got !== undefined) return got;
+      lastErr = null;
+    } catch (err) {
+      lastErr = err;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for ${what}${lastErr ? ` (last error: ${lastErr})` : ''}`);
+    }
     await new Promise((r) => setTimeout(r, 100));
   }
 }
@@ -108,9 +120,21 @@ const selectedName = (win: BrowserWindow) =>
     `document.querySelector('h1[data-selectable]')?.textContent ?? null`,
   ) as Promise<string | null>;
 
+let cleanupDir = '';
+
 async function main(): Promise<void> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'recruitai-loop-'));
   process.env.RECRUITAI_DATA = dataDir;
+  cleanupDir = dataDir;
+
+  // Watchdog: every waitFor has a deadline, but app.whenReady() and a poll
+  // that never resolves do not — without this, a hang bills the CI job's
+  // full timeout instead of failing in three minutes.
+  const watchdog = setTimeout(() => {
+    console.error('✗ loop harness watchdog: no verdict after 180s — failing the run');
+    app.exit(1);
+  }, 180_000);
+  watchdog.unref?.();
 
   // Seed BEFORE the app boots: same db module, same migrations, same file the
   // main process will open — the app starts life with reviewable companies.
@@ -130,9 +154,14 @@ async function main(): Promise<void> {
   // button does, then reload — unconditional, so local machines with stale
   // Electron userData and fresh CI runners behave identically.
   await win.webContents.executeJavaScript(`localStorage.setItem('recruitai.setupComplete', '1')`);
+  // Deterministic reload wait: the old fixed-sleep-then-poll could observe the
+  // OLD page settled before the reload IPC flipped isLoading on a slow runner.
+  const reloaded = new Promise<void>((resolve) => win.webContents.once('did-finish-load', () => resolve()));
   win.webContents.reload();
-  await new Promise((r) => setTimeout(r, 300));
-  await waitFor('reload complete', 15_000, () => !win.webContents.isLoading() || undefined);
+  await Promise.race([
+    reloaded,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('reload did not finish in 15s')), 15_000)),
+  ]);
   win.webContents.focus();
 
   // The seeded list must actually render.
@@ -172,6 +201,9 @@ async function main(): Promise<void> {
   // after seeding. Reading the truth from a fresh connection is also the more
   // honest probe: it sees only what was durably written.
   const probe = new DatabaseSync(path.join(dataDir, 'recruitai.db'));
+  // The app's connection carries busy_timeout 5000; a probe without one can
+  // throw SQLITE_BUSY during a WAL checkpoint and fail the run spuriously.
+  probe.exec('PRAGMA busy_timeout = 5000');
   await waitFor(`"${target}" approved in the database`, 5_000, () => {
     const row = probe
       .prepare(`SELECT status FROM company WHERE name = ?`)
@@ -227,9 +259,7 @@ async function main(): Promise<void> {
   if (sendStats.queued >= 1) ok(`send stats report ${sendStats.queued} queued over live IPC`);
   else fail(`send stats report ${sendStats.queued} queued — expected at least 1`);
   probe.close();
-
   server.close();
-  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 
   if (failures.length) {
     console.error(`\nLOOP TEST FAILED (${failures.length})`);
@@ -243,4 +273,14 @@ async function main(): Promise<void> {
 main().catch((err) => {
   console.error('✗ loop harness crashed:', err);
   app.exit(1);
+});
+
+// Cleanup on BOTH verdicts: a thrown waitFor used to jump straight past the
+// rmSync and leak the tmpdir (ephemeral on CI, accumulating locally).
+app.on('will-quit', () => {
+  try {
+    if (cleanupDir) fs.rmSync(cleanupDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch {
+    /* best effort — a leaked tmpdir must not mask the real verdict */
+  }
 });

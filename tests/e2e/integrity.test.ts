@@ -22,7 +22,19 @@ import { installElectronStub } from './electron-stub.js';
 import { Worker, isMainThread, workerData } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 
-import { openDb, SCHEMA_VERSION, all, get, run, tx, backup, dbStats, type Db } from '../../src/main/db/index.js';
+import {
+  openDb,
+  SCHEMA_VERSION,
+  all,
+  get,
+  run,
+  tx,
+  ulid,
+  backup,
+  dbStats,
+  isSyncedFolder,
+  type Db,
+} from '../../src/main/db/index.js';
 
 installElectronStub();
 
@@ -65,6 +77,7 @@ import {
   __commitApiCallForTests as commitApiCall,
 } from '../../src/main/verify/verifier.js';
 import { clearMxMemoryCache, lookupDomainMx, prefilter, type DomainMxInfo } from '../../src/main/verify/mx.js';
+import { seedsFromDb } from '../../src/main/verify/pattern.js';
 
 let tmpRoot = '';
 let seq = 0;
@@ -677,6 +690,145 @@ describe('MX prefilter caching', () => {
       assert.equal(pre.worthVerifying, true);
     } finally {
       db.close();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('pattern seeds are found by index, not by scanning the database', () => {
+  test('seeds are collected per domain from contacts and observations', () => {
+    const db = openDb(freshPath('seeds'));
+    try {
+      tx(db, () => {
+        for (const [i, domain] of ['acme.test', 'other.test'].entries()) {
+          const companyId = `C_SEED_${i}`;
+          run(db, `INSERT INTO company (id, domain, name, name_norm) VALUES (?, ?, ?, ?)`, companyId, domain, domain, domain);
+          const contactId = ulid(1_800_000_000_000 + i);
+          run(
+            db,
+            `INSERT INTO contact (id, company_id, full_name, first_name, last_name, email, email_verdict)
+             VALUES (?, ?, ?, ?, ?, ?, 'valid')`,
+            contactId,
+            companyId,
+            `Ada Lovelace ${i}`,
+            'Ada',
+            'Lovelace',
+            `ada.lovelace@${domain}`,
+          );
+          // An observed address that never became its own contact row.
+          run(
+            db,
+            `INSERT INTO field_observation (entity, entity_id, field, value, source)
+             VALUES ('contact', ?, 'email', ?, 'careers_page')`,
+            contactId,
+            `A.Lovelace@${domain.toUpperCase()}`,
+          );
+        }
+      });
+
+      const seeds = seedsFromDb(db, 'acme.test');
+      const found = seeds.map((s) => s.email.toLowerCase()).sort();
+      assert.deepEqual(found, ['a.lovelace@acme.test', 'ada.lovelace@acme.test']);
+      // Mixed case in the stored value must still match the domain, and the
+      // other domain's seeds must not leak in.
+      assert.ok(!found.some((e) => e.includes('other.test')));
+      assert.equal(seedsFromDb(db, 'nobody.test').length, 0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('both seed queries seek an index instead of scanning', () => {
+    const db = openDb(freshPath('seeds-plan'));
+    try {
+      // Every plan line must be a SEARCH on the expression index. A SCAN here
+      // means the query text and the index expression have drifted apart, and
+      // the cost silently goes back to O(whole database) per company.
+      const contactPlan = all<{ detail: string }>(
+        db,
+        `EXPLAIN QUERY PLAN
+         SELECT first_name FROM contact
+          WHERE email IS NOT NULL
+            AND substr(lower(email), instr(lower(email), '@') + 1) = 'acme.test'`,
+      ).map((r) => r.detail);
+      assert.ok(
+        contactPlan.some((d) => d.includes('contact_email_domain')),
+        `contact seed lookup is not using its index: ${contactPlan.join(' | ')}`,
+      );
+
+      const obsPlan = all<{ detail: string }>(
+        db,
+        `EXPLAIN QUERY PLAN
+         SELECT fo.value FROM field_observation fo
+          WHERE fo.entity = 'contact' AND fo.field = 'email' AND fo.value IS NOT NULL
+            AND substr(lower(fo.value), instr(lower(fo.value), '@') + 1) = 'acme.test'
+            AND fo.source <> 'pattern_inference'`,
+      ).map((r) => r.detail);
+      assert.ok(
+        obsPlan.some((d) => d.includes('fo_email_domain')),
+        `observation seed lookup is not using its index: ${obsPlan.join(' | ')}`,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test('the verifier evidence cache lookup seeks too', () => {
+    const db = openDb(freshPath('evidence-plan'));
+    try {
+      const plan = all<{ detail: string }>(
+        db,
+        `EXPLAIN QUERY PLAN
+         SELECT id, body, encoding, fetched_at FROM raw_response
+          WHERE source = ? AND url = ? ORDER BY fetched_at DESC LIMIT 1`,
+        'verifier',
+        'verify://reoon/ada@acme.test',
+      ).map((r) => r.detail);
+      // Without (source, url) a cache MISS — the common case for a new address
+      // — walked every verdict ever stored.
+      assert.ok(
+        plan.some((d) => d.includes('raw_source_url')),
+        `evidence cache lookup is not using its index: ${plan.join(' | ')}`,
+      );
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the cloud-synced-folder warning actually fires', () => {
+  test('it catches where the operator would really put this database', () => {
+    for (const p of [
+      // macOS 12.3+: every provider mounts under CloudStorage.
+      '/Users/ada/Library/CloudStorage/GoogleDrive-ada@example.com/recruitAI/recruitai.db',
+      '/Users/ada/Library/CloudStorage/OneDrive-Contoso/recruitai.db',
+      '/Users/ada/Library/CloudStorage/Dropbox/recruitai.db',
+      '/Users/ada/Library/Mobile Documents/com~apple~CloudDocs/recruitai.db',
+      '/Users/ada/Dropbox/recruitAI/recruitai.db',
+      '/Volumes/GoogleDrive/My Drive/recruitai.db',
+      // Windows, where backslashes made the old check dead code.
+      'C:\\Users\\Ada\\OneDrive - Contoso\\recruitAI\\recruitai.db',
+      'C:\\Users\\Ada\\Dropbox\\recruitai.db',
+      'C:\\Users\\Ada\\iCloudDrive\\recruitai.db',
+      // Case, because both macOS and Windows paths are case-insensitive.
+      '/Users/ada/dropbox/recruitai.db',
+    ]) {
+      assert.equal(isSyncedFolder(p), true, `missed a synced folder: ${p}`);
+    }
+  });
+
+  test('it does not cry wolf on ordinary locations', () => {
+    for (const p of [
+      '/Users/ada/Library/Application Support/recruitAI/recruitai.db',
+      '/Users/ada/Desktop/recruitAI/data/recruitai.db',
+      '/var/folders/tmp/recruitai-test/recruitai.db',
+      'C:\\Users\\Ada\\AppData\\Roaming\\recruitAI\\recruitai.db',
+      '/home/ada/.local/share/recruitAI/recruitai.db',
+    ]) {
+      assert.equal(isSyncedFolder(p), false, `false alarm on: ${p}`);
     }
   });
 });

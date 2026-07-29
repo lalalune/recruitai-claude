@@ -141,6 +141,26 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ANALYZE raw_response;
     `,
   },
+  {
+    // Pattern inference asked "which observed addresses are at this domain?"
+    // with lower(email) LIKE '%@domain' — a leading wildcard, so it scanned
+    // every contact AND every field_observation, once per company verified.
+    // Measured 21ms per company at 20k contacts + 20k observations, growing
+    // with the whole database: a full verification pass spent minutes here.
+    // The expression must stay byte-identical to EMAIL_DOMAIN_EXPR in
+    // verify/pattern.ts or SQLite silently declines to use these.
+    version: 5,
+    sql: `
+      CREATE INDEX contact_email_domain
+        ON contact(substr(lower(email), instr(lower(email), '@') + 1))
+        WHERE email IS NOT NULL;
+      CREATE INDEX fo_email_domain
+        ON field_observation(substr(lower(value), instr(lower(value), '@') + 1))
+        WHERE entity = 'contact' AND field = 'email' AND value IS NOT NULL;
+      ANALYZE contact;
+      ANALYZE field_observation;
+    `,
+  },
 ];
 
 /** The newest schema this build knows how to produce and read. */
@@ -276,13 +296,42 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+const SYNCED_FOLDER_MARKERS = [
+  // macOS 12.3+ mounts EVERY provider here — Google Drive, OneDrive, Dropbox,
+  // Box — so its absence meant the warning did not fire for any of them on a
+  // current Mac, which is the machine this app is built for.
+  '/library/cloudstorage/',
+  '/library/mobile documents/', // iCloud Drive
+  '/dropbox/',
+  '/google drive/',
+  '/googledrive/', // /Volumes/GoogleDrive, the pre-12.3 mount
+  '/onedrive', // "OneDrive - Contoso", "OneDrive-Personal": no trailing slash
+  '/icloud',
+  '/box sync/',
+  '/pcloud',
+  '/sync.com/',
+  '/megasync/',
+  '/nextcloud/',
+  '/owncloud/',
+  '/seafile/',
+  '/creative cloud files',
+];
+
 /**
  * SQLite's WAL mode relies on shared-memory locking that cloud-sync folders
  * break, and the failure is silent corruption rather than an error. Warn loudly.
  */
+export function isSyncedFolder(file: string): boolean {
+  // Backslashes first: on Windows every one of these paths uses them, so a
+  // forward-slash-only check never matched and the warning was dead code on
+  // that platform. Lowercase because macOS and Windows paths are both
+  // case-insensitive and the operator's folder may be spelled any way.
+  const norm = file.replace(/\\/g, '/').toLowerCase();
+  return SYNCED_FOLDER_MARKERS.some((m) => norm.includes(m));
+}
+
 function warnIfSyncedFolder(file: string): void {
-  const risky = ['/Library/Mobile Documents/', '/Dropbox/', '/Google Drive/', '/OneDrive/', '/iCloud'];
-  if (risky.some((r) => file.includes(r))) {
+  if (isSyncedFolder(file)) {
     console.warn(
       `[db] WARNING: database is inside a cloud-synced folder (${file}).\n` +
         `     SQLite WAL mode can corrupt silently there. Move it with RECRUITAI_DATA.`,
