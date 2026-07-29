@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import {
   openDb,
@@ -559,6 +560,78 @@ describe('backup', () => {
       } finally {
         copy.close();
       }
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Refusing to open a database we cannot vouch for
+//
+// Both of these states are reachable in the field and neither is recoverable by
+// guessing. What matters is that openDb REFUSES with a message naming the cause
+// and something to do — the packaged app shows exactly this text in its
+// startup dialog, so a cryptic string here is a dead end for the operator.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('openDb refuses databases it cannot vouch for', () => {
+  test('a half-applied v0 file is named as such, not "table already exists"', () => {
+    // The shape a build predating the atomic migrate() left behind: schema
+    // objects present, user_version never bumped. Found on a real machine.
+    const file = freshDbPath('half-applied');
+    const seeded = new DatabaseSync(file);
+    try {
+      seeded.exec('CREATE TABLE company (id TEXT PRIMARY KEY) STRICT');
+      assert.equal(
+        (seeded.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+        0,
+        'precondition: the file claims v0 while already holding a table',
+      );
+    } finally {
+      seeded.close();
+    }
+
+    assert.throws(
+      () => openDb(file),
+      (err: Error) => {
+        // The pre-fix failure was `Migration 1 failed: ... table company already
+        // exists`, which names neither the cause nor a remedy.
+        assert.match(err.message, /schema v0/);
+        assert.match(err.message, /half-initialised|half-initialized/);
+        assert.match(err.message, /RECRUITAI_DATA|delete the/);
+        return true;
+      },
+    );
+  });
+
+  test('a file from a newer build is refused rather than written to', () => {
+    const file = freshDbPath('from-the-future');
+    const ahead = openDb(file);
+    try {
+      ahead.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    } finally {
+      ahead.close();
+    }
+
+    assert.throws(
+      () => openDb(file),
+      (err: Error) => {
+        assert.match(err.message, new RegExp(`schema v${SCHEMA_VERSION + 1}`));
+        assert.match(err.message, /newer version/);
+        return true;
+      },
+    );
+  });
+
+  test('a genuinely empty file still migrates all the way up', () => {
+    // The guard keys on "v0 with tables", so it must not fire on a fresh file.
+    const db = freshDb('still-fresh');
+    try {
+      assert.equal(
+        (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+        SCHEMA_VERSION,
+      );
     } finally {
       db.close();
     }

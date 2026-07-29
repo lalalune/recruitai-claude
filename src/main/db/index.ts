@@ -218,6 +218,30 @@ function migrate(db: Db): number {
     );
   }
 
+  // v0 means "no migration has ever completed", so the file should be empty.
+  // If it already holds our tables, migration 1 is about to fail on the first
+  // CREATE TABLE with a bare "table company already exists" — true, but it
+  // names neither the cause nor anything to do about it. This state is not
+  // reachable from the migration loop below (each migration commits its DDL and
+  // its user_version bump in one transaction); it means the file was written by
+  // a build that predates that guarantee, or by something else entirely.
+  // Refusing with the file named beats a cryptic failure or a blind wipe of a
+  // database whose contents we cannot vouch for.
+  if (startedAt === 0) {
+    const existing = get<{ n: number }>(
+      db,
+      `SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+    )?.n;
+    if (existing) {
+      throw new Error(
+        `Database reports schema v0 (no migration has ever completed) but already contains ` +
+          `${existing} table(s). It was left half-initialised by an older build, or was not written ` +
+          `by recruitAI. Refusing to open it rather than guess at its contents. Move or delete the ` +
+          `database file and restart to begin a fresh one, or point RECRUITAI_DATA at a different folder.`,
+      );
+    }
+  }
+
   for (const m of MIGRATIONS) {
     if (m.version <= startedAt) continue;
     // BEGIN IMMEDIATE, not BEGIN: a deferred transaction only takes the write

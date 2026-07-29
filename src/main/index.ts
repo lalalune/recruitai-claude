@@ -7,7 +7,7 @@
  * synchronous but its writes are sub-millisecond at this scale.
  */
 
-import { app, BrowserWindow, protocol, net, session, shell } from 'electron';
+import { app, BrowserWindow, dialog, protocol, net, session, shell } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -203,10 +203,42 @@ function denyAllPermissions(): void {
   ses.setPermissionCheckHandler(() => false);
 }
 
+/**
+ * The last-resort surface for a failure that happens before there is a window.
+ *
+ * Shows the real message rather than a generic "something went wrong": every
+ * error that reaches here is one migrate() wrote to be acted on, and it names
+ * the folder to act on it in. Then quits — an app with no window and no
+ * database is not in a state any later code can recover from.
+ */
+function reportFatalStartupError(err: unknown): void {
+  const detail = err instanceof Error ? err.message : String(err);
+  console.error('[startup] fatal:', err);
+  dialog.showErrorBox(
+    'recruitAI could not start',
+    `${detail}\n\nDatabase folder:\n${DATA_DIR}`,
+  );
+  app.quit();
+}
+
 app.whenReady().then(() => {
   if (!isPrimary) return;
   denyAllPermissions();
-  initDb(path.join(DATA_DIR, 'recruitai.db'));
+
+  // Startup is the one place with no UI to report into yet: the window does not
+  // exist until initDb returns. Without this catch a failure here rejects the
+  // whenReady promise, no window is ever created, and the app sits in the dock
+  // doing nothing — the operator gets silence, and migrate()'s deliberately
+  // actionable messages (schema downgrade, half-applied schema) are written to
+  // a stderr no packaged user ever reads. A native dialog is the only surface
+  // that exists this early.
+  try {
+    initDb(path.join(DATA_DIR, 'recruitai.db'));
+  } catch (err) {
+    reportFatalStartupError(err);
+    return;
+  }
+
   if (!isDev) registerAppProtocol();
   createWindow();
   registerIpc(mainWindow!);
@@ -222,7 +254,11 @@ app.whenReady().then(() => {
       wireWindow(mainWindow!);
     }
   });
-});
+})
+  // Anything else that throws during startup (window creation, IPC
+  // registration) lands here rather than as an unhandled rejection with no
+  // window to show it.
+  .catch(reportFatalStartupError);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
