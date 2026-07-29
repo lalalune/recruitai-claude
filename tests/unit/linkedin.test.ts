@@ -159,7 +159,7 @@ before(() => {
 
 after(() => {
   closeDb();
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));

@@ -47,7 +47,7 @@ if (!process.env.RECRUITAI_DATA) process.env.RECRUITAI_DATA = stubDataDir;
 // rmSync is synchronous, so it completes inside an 'exit' handler.
 process.on('exit', () => {
   try {
-    fs.rmSync(stubDataDir, { recursive: true, force: true });
+    fs.rmSync(stubDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   } catch {
     /* best effort — a leaked temp dir is not worth failing a run over */
   }

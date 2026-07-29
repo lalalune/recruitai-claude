@@ -160,7 +160,7 @@ async function main(): Promise<void> {
   }
 
   server.close();
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 
   if (failures.length) {
     console.error(`\nBOOT TEST FAILED (${failures.length} failure${failures.length === 1 ? '' : 's'})`);
