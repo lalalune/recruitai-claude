@@ -140,6 +140,29 @@ const SHORTCUTS: { group: string; items: [string, string][] }[] = [
       [`${MOD}+click`, 'Toggle row selection'],
     ],
   },
+  // Outreach binds its own keys per tab. They were live but undocumented, which
+  // is how `n` (suppress the domain, on Replies) stayed invisible next to `n`
+  // (next draft, on Drafts).
+  {
+    group: 'Outreach · drafts',
+    items: [
+      [`${MOD}+↵`, 'Queue for sending'],
+      ['s', 'Skip this draft'],
+      ['x', 'Reject the company'],
+      ['n', 'Next draft'],
+    ],
+  },
+  {
+    group: 'Outreach · queue & replies',
+    items: [
+      ['j / k', 'Move through the queue'],
+      ['x', 'Return the queued draft to Drafts'],
+      ['p', 'Reply: mark positive'],
+      ['n', 'Reply: mark negative (suppresses the domain)'],
+      ['b', 'Reply: confirm bounce'],
+      ['o', 'Reply: open the thread in Gmail'],
+    ],
+  },
 ];
 
 export interface ShortcutsOverlayProps {

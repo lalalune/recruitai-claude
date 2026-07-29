@@ -26,7 +26,7 @@ import {
   SECRET_ANTHROPIC,
   SECRET_VERIFIER,
 } from '../settings.js';
-import { emitEvent } from '../pipeline/run.js';
+import { emitEvent, appendLog } from '../pipeline/run.js';
 import { recomputeCompany } from '../pipeline/scoring.js';
 import {
   companySuppressionValues,
@@ -169,7 +169,7 @@ export function removeSuppression(db: Db, id: number): void {
               AND NOT EXISTS (
                 SELECT 1 FROM suppression s
                  WHERE (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH})
-                    OR (s.kind = 'domain' AND co.domain IS NOT NULL AND lower(s.value) = lower(co.domain))
+                    OR (s.kind = 'domain' AND co.domain IS NOT NULL AND s.value = lower(co.domain))
               )`,
           ...candidateArgs,
         )
@@ -249,8 +249,8 @@ export function importSuppressionsCsv(db: Db, csv: string): number {
               SELECT c.id FROM contact c
                WHERE c.email IS NOT NULL AND EXISTS (
                  SELECT 1 FROM suppression s
-                  WHERE (s.kind = 'email'  AND lower(s.value) = lower(c.email))
-                     OR (s.kind = 'domain' AND lower(s.value) = lower(substr(c.email, instr(c.email, '@') + 1)))))`,
+                  WHERE (s.kind = 'email'  AND s.value = lower(c.email))
+                     OR (s.kind = 'domain' AND s.value = lower(substr(c.email, instr(c.email, '@') + 1)))))`,
         Date.now(),
       );
       run(
@@ -268,7 +268,7 @@ export function importSuppressionsCsv(db: Db, csv: string): number {
           WHERE co.status != 'suppressed'
             AND EXISTS (
               SELECT 1 FROM suppression s
-               WHERE (s.kind = 'domain' AND co.domain IS NOT NULL AND lower(s.value) = lower(co.domain))
+               WHERE (s.kind = 'domain' AND co.domain IS NOT NULL AND s.value = lower(co.domain))
                   OR (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH}))`,
         Date.now(),
       );
@@ -374,9 +374,9 @@ const EXPORTS: Record<'companies' | 'contacts' | 'drafts', { headers: string[]; 
                  c.email_verdict, c.email_verified_at, c.phone, c.linkedin_url, c.is_primary,
                  c.contact_score, c.status, c.reviewed, c.notes, co.quality_score AS company_quality_score,
                  EXISTS (SELECT 1 FROM suppression s
-                          WHERE (s.kind = 'email' AND lower(s.value) = lower(c.email))
+                          WHERE (s.kind = 'email' AND s.value = lower(c.email))
                              OR (s.kind = 'domain' AND c.email IS NOT NULL
-                                 AND lower(s.value) = lower(substr(c.email, instr(c.email, '@') + 1)))
+                                 AND s.value = lower(substr(c.email, instr(c.email, '@') + 1)))
                              OR (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH})) AS suppressed
             FROM contact c JOIN company co ON co.id = c.company_id WHERE 1=1 /*SCOPE*/
            ORDER BY co.quality_score DESC, c.contact_score DESC`,
@@ -423,7 +423,9 @@ export function exportCsv(db: Db, what: 'companies' | 'contacts' | 'drafts', com
   fs.mkdirSync(dir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const file = path.join(dir, `${what}-${stamp}.csv`);
-  fs.writeFileSync(file, toCsv(spec.headers, rows), 'utf8');
+  // UTF-8 BOM: Excel (Windows, and older Mac) opens BOM-less UTF-8 CSVs as
+  // mojibake on double-click — CJK and accented names in exports were garbage.
+  fs.writeFileSync(file, `﻿${toCsv(spec.headers, rows)}`, 'utf8');
   return file;
 }
 
@@ -519,6 +521,23 @@ export function getScreenshot(relPath: string): string | null {
 // Registration
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * safeStorage has no keyring to talk to on some Linux desktops, and the secret
+ * store falls back to marked plaintext there. The store already warns — to
+ * stderr, which nobody running a packaged app ever sees, while the UI's own
+ * toast says "saved to the OS keychain". Put it where the operator is looking.
+ */
+async function warnIfPlaintext(): Promise<void> {
+  if (await gmail.encryptionAvailable()) return;
+  appendLog(
+    'settings',
+    'warn',
+    'This system has no OS keychain available (safeStorage), so saved keys and the Gmail refresh token ' +
+      'are stored as PLAINTEXT in the local database. Install a system keyring (gnome-keyring / kwallet) ' +
+      'and save them again.',
+  );
+}
+
 export function registerSettingsIpc(): void {
   handle('getSettings', async () => getSettings());
 
@@ -546,7 +565,20 @@ export function registerSettingsIpc(): void {
     }
 
     const normalised = normaliseSecretKey(raw);
+    // The schema only constrains the SHAPE of the key. Without this the
+    // renderer could name any row in the `setting` table: 'gmail.refresh_token'
+    // (plant or destroy the mailbox grant), 'gmail.client_secret' (point the
+    // consent flow at someone else's OAuth client), or 'linkedin.halt' /
+    // 'linkedin.budget.<day>' — whose readers JSON.parse the value, so writing
+    // an opaque ciphertext there makes the day-stop and the daily budget read
+    // back as "none", which is exactly the retry path session.ts promises does
+    // not exist. Only the two keys the Settings screen actually writes are
+    // reachable from here.
+    if (normalised !== SECRET_VERIFIER && normalised !== SECRET_ANTHROPIC) {
+      throw new Error(`Unknown secret "${key}".`);
+    }
     await writeSecret(normalised, value);
+    if (value) await warnIfPlaintext();
     auditLog(getDb(), { actor: 'operator', action: 'setSecret', entity: 'setting', entityId: normalised });
   });
 
@@ -556,6 +588,7 @@ export function registerSettingsIpc(): void {
 
   handle('connectGmail', async () => {
     const result = await gmail.connectGmail();
+    if (result.ok) await warnIfPlaintext();
     emitEvent('data:changed', { entity: 'draft' });
     return result;
   });

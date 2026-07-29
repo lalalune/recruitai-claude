@@ -1,0 +1,35 @@
+name: live-canary
+
+# The free-source layer (Greenhouse/Ashby/Lever JSON endpoints, the YC
+# directory, HN Algolia) can drift server-side with zero changes on our end.
+# This weekly canary runs the RECRUITAI_NET-gated live tests plus the full
+# pipeline smoke so drift shows up as a red run, not as a silent week of
+# empty sweeps on the operator's machine.
+
+on:
+  schedule:
+    - cron: '17 14 * * 1' # Mondays 14:17 UTC — off the top-of-hour stampede
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - run: bun install --frozen-lockfile
+
+      - name: Live source tests (real endpoints)
+        run: RECRUITAI_NET=1 bun run test "live sources"
+
+      - name: Full pipeline smoke (live YC → live boards → scored reqs)
+        run: bun run smoke

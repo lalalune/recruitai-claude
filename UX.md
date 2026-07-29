@@ -136,7 +136,7 @@ A second row of toggle chips (multi-select): Has verified email · No in-house T
 **Row anatomy:** `[score] CompanyName · headcount · N reqs · [chips]`
 Chips: `●` unreviewed, `⚠` has conflict, `✉` email verified, `⛔` suppressed, `↩` replied.
 
-**Interactions:** `j`/`k` or ↑/↓ move; click selects; `shift+click` range-selects; `cmd+click` toggles; `space` peeks without advancing. Selection persists across filter changes. Multi-select reveals a bulk `ActionBar`: Approve all · Reject all · Re-discover contacts · Suppress domain · Export CSV (exports the selected companies; with nothing selected it exports everything).
+**Interactions:** `j`/`k` or ↑/↓ move; click selects; `shift+click` range-selects; `cmd+click` toggles; `space` peeks without advancing; `esc` clears marks (or blurs search). Selection persists across filter changes. Multi-select reveals a bulk `ActionBar`: Approve N · Reject N · Re-discover contacts · Suppress domains · Export CSV (the selected companies; export-everything lives in the command palette, since the bar only exists while something is selected).
 
 ### 5.3 Right pane sections
 
@@ -177,6 +177,7 @@ Verification chips: `valid` green · `catch-all` amber · `unknown` grey · `inv
 | `/` | Focus search |
 | `cmd+k` | Command palette |
 | `cmd+z` | Undo last action (10-deep) |
+| `esc` | Clear marks · blur search |
 | `?` | Shortcut overlay |
 
 **Approve advances automatically.** That single behaviour is most of the throughput difference — no return trip to the list.
@@ -202,13 +203,15 @@ Actions: `⌘↵` Queue for sending · `s` Skip · `x` Reject · `n` Next · **T
 
 **Generation happens in the background** as soon as a company is approved, so drafts are waiting when you arrive rather than spinning.
 
+**Failed sends** (a crash or shutdown mid-send) surface in a strip above the drafts list with per-item Requeue / Discard — the strip says to check Gmail's Sent folder first, because an interrupted send may already have gone out. Nothing is ever resent automatically.
+
 ### 6.2 Queue
 
 The paced sender. This screen is mostly a governor readout.
 
-- **Header:** `47 / 400 today · 3 / 20 this hour · next send in 2m 14s`
+- **Header:** `47 / 400 today · 3 / 20 this hour · next send in 2m 14s`. When the sender pauses itself (circuit breaker, Gmail quota, expired auth) the header says *paused automatically* and a banner underneath states the exact reason.
 - **Controls:** ▶ Start · ⏸ Pause · ⏭ Send next now
-- **List:** ordered queue with scheduled send time per item; `x` (or the trash button) returns a draft to the Drafts tab untouched. (Order comes from the pacing engine — there is no manual drag-reorder.)
+- **List:** ordered queue with scheduled send time per item; `j`/`k` move the selection; `x` (or the trash button) returns a draft to the Drafts tab untouched. (Order comes from the pacing engine — there is no manual drag-reorder.)
 - **Settings inline:** sends per hour (default 20, max 200), sends per day (default 150, max 500 — Gmail's own ceiling), active window (default 9am–5pm local), jitter (default ±40%, max 90), weekend sending (default off).
 
 Sends fire on a jittered timer inside the active window. Closing the app pauses the queue; reopening resumes without double-sending (each send is guarded by a unique idempotency key).
@@ -217,8 +220,8 @@ Sends fire on a jittered timer inside the active window. Closing the app pauses 
 
 Every message that left, newest first, with its outcome chip (`sent` · `silent` · `replied` · `bounced`).
 
-- **Reply rates strip** — reply and bounce rates broken down by template band and copy kind (built-in · custom template · follow-up), computed from the send ledger. This is the copy-iteration loop: edit a template in Settings, watch its band's rate move here.
-- **Bounce circuit breaker** — if ≥3 of the trailing 50 sends bounced (and ≥10%), sending pauses itself before another message can damage the account's reputation; the pause reason names the numbers.
+- **Reply rates strip** — reply rate plus bounce count broken down by template band and copy kind (built-in · custom template · follow-up), computed from the send ledger. This is the copy-iteration loop: edit a template in Settings, watch its band's rate move here.
+- **Bounce circuit breaker** — once at least 10 outcomes exist, if ≥3 of the trailing 50 sends bounced (and ≥10%), sending pauses itself before another message can damage the account's reputation. The pause reason (with the numbers) shows in the Queue header banner and the Pipeline log. The ≥10 floor is deliberate: 3 bounces in the first handful of sends is a list-quality signal, not a statistical one.
 
 - **Follow up** — for a sent-and-silent message at least two days old, drafts a short bump that **threads onto the original Gmail conversation** (same thread id, proper `In-Reply-To`/`References`). Refused with a reason when they replied, the address bounced, an active follow-up already exists, or the roles the thread was about have closed.
 - Follow-up drafts appear in the Drafts tab like any other draft and ride the same queue, pacing, and suppression barriers.
@@ -228,7 +231,7 @@ Every message that left, newest first, with its outcome chip (`sent` · `silent`
 Left: inbound messages matched to companies, newest first, with type chips: `reply` · `bounce` · `auto-reply` · `unmatched`.
 Right: the message thread plus the company card.
 
-Actions: `p` Mark positive → prompts to create a follow-up task · `n` Mark negative → suppresses the domain · `b` Confirm bounce → marks the address invalid and, if another decision-maker exists at that company, **offers to draft the next one** · `o` Open in Gmail.
+Actions: `p` Mark positive → flags the contact/company as replied (the toast says to follow up from the thread; no task is created) · `n` Mark negative → suppresses the sender's **domain** — unless it is a freemail address (gmail.com and friends), where only the **address** is suppressed so one founder's "no" cannot block every gmail.com contact. The toast states which scope applied and carries an inline **Undo** that removes exactly the suppression rows created · `b` Confirm bounce → marks the address invalid and, if another decision-maker exists at that company, **offers to draft the next one** · `o` Open in Gmail.
 
 This closes the loop you asked for: a bounce or a no becomes the trigger to advance to the next contact at the same company.
 
@@ -238,7 +241,7 @@ This closes the loop you asked for: a bounce or a no becomes the trigger to adva
 
 One card per source. Each card: name, enabled toggle, last run time, records found, [Run] button, and a progress bar while running.
 
-**Sources:** YC directory · ATS sweep (Greenhouse, Ashby, Lever, SmartRecruiters, Workable — Workday is parsed but not probed; it needs per-company tenant+site discovery) · Careers-page crawler · HN Who's Hiring · SEC Form D · LinkedIn *(off by default)* · Email discovery · Email verification · Scoring · Draft generation.
+**Sources (in run order):** YC directory · ATS sweep (Greenhouse, Ashby, Lever, SmartRecruiters, Workable — Workday is parsed but not probed; it needs per-company tenant+site discovery) · Careers-page crawler · LinkedIn URL discovery · HN Who's Hiring · SEC Form D · LinkedIn *(off by default)* · Scoring · Contact discovery · Email verification · Draft generation. Scoring runs **before** the paid enrichment steps on purpose: the enrichment gate reads quality scores, so scoring first means verification money only ever flows to companies that currently qualify.
 
 **Global controls:** ▶ Run all · ⏹ Stop · a live log tail (last 200 lines, filterable by source) · a spend counter showing per-source and total cost.
 
@@ -256,7 +259,8 @@ Single scrolling page, sectioned. No tabs.
 
 **Gmail** — connect / disconnect, connected address, token status, test-send button.
 **API keys** — verification provider key, LLM key. Masked, with a test button each.
-**Rate limits** — sends/hour, sends/day, active window, jitter, crawl concurrency, LinkedIn profiles/day.
+**Rate limits** — sends/hour, sends/day, active window, jitter, crawl concurrency.
+**LinkedIn** — its own section: profiles/day budget and session controls (kept apart from Rate limits because it manages a logged-in browser session, not a faceless crawler).
 **ICP** — headcount min/max (default 3–1000), require Bay Area (single toggle), stale-req threshold in days (default 45), **excluded keywords** (matched against company name and industry), deprioritise companies with in-house TA above N recruiters. *(Speced but not implemented: a per-county geography multi-select — geography shipped as the single toggle — an included-industries list, and a minimum-open-reqs filter.)*
 **Templates** — email templates per company-size band (<20, 20–75, 75–300, 300+), each with variable autocomplete and a live preview.
 **Suppression** — table of suppressed domains and addresses with typed reasons (existing client · competitor · no-agency policy · replied no · bounced · manual). Import CSV, add manually.
@@ -285,9 +289,9 @@ Goal: **from launch to first reviewable record in under five minutes, with zero 
 
 **Conflicts.** When two sources disagree, the field renders amber with a `⚠`. Clicking opens a `ConflictPicker` listing each candidate with its source, date and confidence. Picking one records your choice as a human observation. The `Conflicts` filter collects every such record.
 
-**Optimistic updates.** Approve/reject/reviewed apply instantly and reconcile in the background. On failure, a toast offers retry. The list never blocks on the network — the API is on localhost, but correctness shouldn't depend on that.
+**Optimistic updates.** Approve/reject/reviewed apply instantly and reconcile in the background. On failure the change rolls back and a toast says the save failed — re-doing the action is the retry. The list never blocks on the network — the API is on localhost, but correctness shouldn't depend on that.
 
-**Undo.** A 10-deep undo stack covering approve, reject, field edits and suppression. Toast confirms with an inline Undo.
+**Undo.** A 10-deep `cmd+z` stack on Review covering approve, reject, field edits and the bulk actions (including bulk suppress). Single-key approve/reject stay silent — a toast per `a` at review speed would be noise; `cmd+z` is the confirmation. Outside Review, the Replies `n` suppression carries its own inline toast Undo (scoped to the suppression rows it created).
 
 **Empty and error states.** Every list has an `EmptyState` with one clear action. Source failures surface as a dismissible banner on Pipeline, never a modal.
 

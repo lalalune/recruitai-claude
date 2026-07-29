@@ -176,10 +176,34 @@ async function getWorkerWindow(): Promise<BrowserWindow | null> {
       backgroundThrottling: false,
     },
   });
+  // A hidden worker window has no business spawning visible popups; anything
+  // LinkedIn tries to open is denied rather than shown to the operator.
+  workerWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   workerWindow.on('closed', () => {
     workerWindow = null;
   });
   return workerWindow;
+}
+
+/**
+ * Whether a URL is on LinkedIn at all.
+ *
+ * Everything this module injects into a page — the CSRF token above all — is
+ * only safe because the page is LinkedIn's. A redirect that lands the worker
+ * window somewhere else is not a checkpoint and not an auth wall, so neither
+ * of the two guards below catches it, and the next `executeJavaScript` would
+ * hand the session's `csrf-token` header to whatever page is now loaded.
+ */
+export function isLinkedInUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+  const host = parsed.hostname.toLowerCase();
+  return host === 'linkedin.com' || host.endsWith('.linkedin.com');
 }
 
 export function closeWorkerWindow(): void {
@@ -240,6 +264,12 @@ async function navigateTo(wc: WebContents, url: string): Promise<NavResult> {
     return { ok: false, url: finalUrl, status, error: 'authwall' };
   }
   if (error) return { ok: false, url: finalUrl, status, error };
+  // An empty final URL means the load never committed; `error` above already
+  // describes that case. A committed URL off LinkedIn is a redirect we will
+  // not run scripts against.
+  if (finalUrl && !isLinkedInUrl(finalUrl)) {
+    return { ok: false, url: finalUrl, status, error: 'redirected off linkedin.com' };
+  }
 
   return { ok: true, url: finalUrl, status };
 }
@@ -258,6 +288,12 @@ interface PageFetchResult {
  * exactly the kind of impersonation we do not want to build.
  */
 async function pageFetch(wc: WebContents, url: string, csrf: string): Promise<PageFetchResult | null> {
+  // The token below is only ever handed to LinkedIn's own origin.
+  const loaded = wc.getURL();
+  if (!isLinkedInUrl(loaded)) {
+    return { status: 0, url: loaded, body: '', error: 'not on a linkedin.com page' };
+  }
+
   const script = `(async () => {
     try {
       const res = await fetch(${JSON.stringify(url)}, {

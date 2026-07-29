@@ -140,6 +140,12 @@ export async function fetchLever(token: string): Promise<SourceResult<AtsBoard>>
   const jobs: DiscoveredJob[] = parsed.map((j) => {
     // Lever gives per-year, per-hour, etc. Only trust annual figures for fee math.
     const annual = j.salaryRange?.interval === 'per-year-salary';
+    // …and only in USD. Lever serves CAD/GBP/EUR ranges in the same shape, and
+    // banking one as dollars overstates the fee by up to ~40%, which reorders
+    // the queue. An absent currency is the field simply not being populated.
+    const currency = j.salaryRange?.currency;
+    const usd = currency == null || currency.toUpperCase() === 'USD';
+    const trusted = annual && usd;
     return {
       externalId: j.id,
       title: j.text,
@@ -147,8 +153,8 @@ export async function fetchLever(token: string): Promise<SourceResult<AtsBoard>>
       location: j.categories?.location ?? null,
       isRemote: j.workplaceType === 'remote',
       employmentType: j.categories?.commitment ?? null,
-      compMin: annual ? (j.salaryRange?.min ?? null) : null,
-      compMax: annual ? (j.salaryRange?.max ?? null) : null,
+      compMin: trusted ? (j.salaryRange?.min ?? null) : null,
+      compMax: trusted ? (j.salaryRange?.max ?? null) : null,
       descriptionText: j.descriptionPlain ?? null,
       url: j.hostedUrl,
       publishedAt: epochToIso(j.createdAt),
@@ -181,8 +187,9 @@ export async function fetchSmartRecruiters(token: string): Promise<SourceResult<
 
   // Cap at 10 pages (1000 postings) — beyond that we're looking at an enterprise
   // that is almost certainly out of ICP anyway.
+  const MAX_PAGES = 10;
   let partial = false;
-  for (let page = 0; page < 10; page++) {
+  for (let page = 0; page < MAX_PAGES; page++) {
     const url = `${base}?limit=100&offset=${offset}`;
     const res = await httpRequest(url);
     last = res;
@@ -194,10 +201,21 @@ export async function fetchSmartRecruiters(token: string): Promise<SourceResult<
     if (!firstBody) firstBody = res.body;
 
     const parsed = safeParse<{ content?: SrPosting[]; totalFound?: number }>(res.body);
-    const content = parsed?.content ?? [];
+    const content = parsed?.content;
+    if (!Array.isArray(content)) {
+      // A 200 whose body we cannot read is indistinguishable from a page we
+      // never received. Treating it as an empty page ends the loop looking
+      // complete, and the differ reads a truncated board as a mass close.
+      partial = all.length > 0;
+      break;
+    }
     all.push(...content);
     if (content.length < 100) break;
     offset += 100;
+    // Postings past the cap are open roles we simply did not fetch. Unflagged,
+    // the next refresh closes every one of them and the one after "reposts"
+    // them — fabricating the exact signal the pitch is built on.
+    if (page === MAX_PAGES - 1) partial = true;
   }
 
   if (!last?.ok && all.length === 0) return fail(last ?? emptyRes(base), base);
@@ -458,6 +476,20 @@ function epochToIso(v: string | number | undefined): string | null {
  */
 export function parseCompRange(s: string | null): { min: number; max: number } | null {
   if (!s) return null;
+
+  // A dollar figure with a country prefix ("CA$180,000", "A$200K", "SGD$150k")
+  // is not USD. Converting it would be guesswork and the fee — and therefore
+  // the queue order — would be wrong by tens of percent. "US$" is the one
+  // prefix that means what the rest of the pipeline already assumes.
+  const prefixed = s.match(/\b([A-Za-z]{1,3})\$/);
+  if (prefixed && !/^usd?$/i.test(prefixed[1]!)) return null;
+
+  // Non-annual intervals that clear the $20k floor — "$20,000 - $25,000 per
+  // month" is a real posting shape and reads as a plausible annual salary.
+  if (/\b(?:hourly|weekly|monthly|daily)\b|(?:\b(?:per|an?)|\/)\s*(?:hours?|hrs?|weeks?|wks?|months?|mo|days?)\b/i.test(s)) {
+    return null;
+  }
+
   const matches = [...s.matchAll(/\$\s*([\d,]+(?:\.\d+)?)\s*([KkMm])?/g)];
   if (matches.length < 2) return null;
 

@@ -947,7 +947,7 @@ function isSuppressed(db: Db, company: Company): string | null {
   if (company.domain) {
     const d = get<{ reason: string }>(
       db,
-      "SELECT reason FROM suppression WHERE kind = 'domain' AND lower(value) = ?",
+      "SELECT reason FROM suppression WHERE kind = 'domain' AND value = ?",
       company.domain.toLowerCase(),
     );
     if (d) return `domain suppressed (${d.reason})`;
@@ -969,7 +969,7 @@ function isSuppressed(db: Db, company: Company): string | null {
 
 function emailSuppressed(db: Db, email: string): boolean {
   return Boolean(
-    get<{ id: number }>(db, "SELECT id FROM suppression WHERE kind = 'email' AND lower(value) = ?", email),
+    get<{ id: number }>(db, "SELECT id FROM suppression WHERE kind = 'email' AND value = lower(?)", email),
   );
 }
 
@@ -1348,29 +1348,7 @@ export async function verifyContactById(
   return after ? toContactRow(after) : null;
 }
 
-/**
- * How many paid credits a run over these companies would need, so the Pipeline
- * screen can show a cost before the operator confirms.
- */
-export function estimatePendingVerifications(db: Db, freshnessDays: number): number {
-  const cutoff = Date.now() - freshnessDays * 86_400_000;
-  const withEmail =
-    get<{ n: number }>(
-      db,
-      `SELECT count(*) AS n FROM contact
-        WHERE email IS NOT NULL
-          AND status NOT IN ('rejected','contacted','replied','bounced')
-          AND (email_verified_at IS NULL OR email_verified_at < ?)`,
-      cutoff,
-    )?.n ?? 0;
-  const withoutEmail =
-    get<{ n: number }>(
-      db,
-      `SELECT count(*) AS n FROM contact c
-        JOIN company co ON co.id = c.company_id
-       WHERE c.email IS NULL AND c.first_name IS NOT NULL AND co.domain IS NOT NULL
-         AND c.status NOT IN ('rejected','contacted','replied','bounced')`,
-    )?.n ?? 0;
-  // People with no address get more than one candidate tried.
-  return withEmail + withoutEmail * 2;
-}
+// The pending-verification cost estimator lives in run.ts next to the
+// enrichment gate and runEmailVerify's targeting query, which it must mirror
+// exactly — a detached copy here drifted into quoting spend a run could never
+// incur (it counted contacts at un-gated companies the run never visits).

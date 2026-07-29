@@ -40,7 +40,8 @@ import {
   scoreAll,
 } from '../../src/main/pipeline/scoring.js';
 import { getIcp } from '../../src/main/settings.js';
-import { fetchGreenhouse } from '../../src/main/sources/ats.js';
+import { fetchAshby, fetchGreenhouse, fetchLever } from '../../src/main/sources/ats.js';
+import { fetchYcCompanies, filterYcIcp, listWhoIsHiringThreads } from '../../src/main/sources/seeds.js';
 import type { RunCtx, SourceOutcome } from '../../src/main/pipeline/run.js';
 import type { DiscoveredJob } from '../../src/shared/types.js';
 
@@ -285,8 +286,12 @@ describe('scoring: derived company columns', () => {
     seedReq(db, id, { externalId: 'r1', title: 'Backend Engineer', publishedDaysAgo: 60, compMin: 250_000, compMax: 250_000 });
 
     assert.equal(isSuppressed(db, id, 'client.test'), false);
-    // Stored uppercase on purpose: the lookup is case-insensitive by design.
-    run(db, `INSERT INTO suppression (kind, value, reason) VALUES ('domain', 'CLIENT.TEST', 'existing_client')`);
+    // Stored lowercase: the canonical-value invariant (intake lowercases;
+    // migration v3 repaired legacy rows) is what lets every barrier SEEK the
+    // UNIQUE(kind, value) index instead of scanning the kind. The lookup side
+    // still case-folds its own inputs (domain params go through lower()).
+    run(db, `INSERT INTO suppression (kind, value, reason) VALUES ('domain', 'client.test', 'existing_client')`);
+    assert.equal(isSuppressed(db, id, 'CLIENT.TEST'), true, 'the query lower()s its own parameter');
     assert.equal(isSuppressed(db, id, 'client.test'), true);
     assert.equal(isSuppressed(db, 'C_OTHER', 'somewhere-else.test'), false);
 
@@ -772,4 +777,46 @@ describe('live sources', () => {
       assert.equal(get<{ n: number }>(db, 'SELECT count(*) AS n FROM req')?.n, res.data.jobs.length);
     },
   );
+
+  // The rest of the free-source layer, each against its real endpoint. These
+  // are VERIFIED-SOURCES.md's claims as executable assertions — loose on
+  // volume (boards shrink), strict on shape (API drift must fail loudly).
+  const gate = { skip: !process.env.RECRUITAI_NET ? 'set RECRUITAI_NET=1 to run network tests' : false };
+
+  test('parses a real Ashby board', gate, async () => {
+    const res = await fetchAshby('ashby');
+    assert.ok(res.ok && res.data, `fetch failed: ${res.error ?? res.httpStatus}`);
+    assert.equal(res.data!.platform, 'ashby');
+    assert.ok(res.data!.jobs.length > 0, 'Ashby posts its own roles on its own board');
+    for (const j of res.data!.jobs.slice(0, 5)) {
+      assert.ok(j.externalId && j.title, 'id and title survive the parse');
+    }
+  });
+
+  test('parses a real Lever board', gate, async () => {
+    // Lever's own board is live but empty; Palantir's is large and stable.
+    const res = await fetchLever('palantir');
+    assert.ok(res.ok && res.data, `fetch failed: ${res.error ?? res.httpStatus}`);
+    assert.equal(res.data!.platform, 'lever');
+    assert.ok(res.data!.jobs.length > 0);
+    assert.match(res.data!.jobs[0]!.url, /^https?:\/\//);
+  });
+
+  test('fetches the live YC directory and filters ICP', gate, async () => {
+    const res = await fetchYcCompanies();
+    assert.ok(res.ok && res.data, `fetch failed: ${res.error}`);
+    assert.ok(res.data!.length > 4000, `YC directory shrank implausibly (${res.data!.length})`);
+    const icp = filterYcIcp(res.data!, { minTeam: 3, maxTeam: 1000, requireHiring: true });
+    assert.ok(icp.length > 100, `ICP filter yielded only ${icp.length} — check field drift`);
+    assert.ok(icp.every((c) => c.team_size == null || c.team_size >= 3));
+  });
+
+  test('lists live HN Who-is-hiring threads', gate, async () => {
+    const threads = await listWhoIsHiringThreads(3);
+    assert.ok(threads.length >= 2, `expected recent monthly threads, got ${threads.length}`);
+    for (const t of threads) {
+      assert.match(t.title, /who is hiring/i);
+      assert.ok(Number(t.objectID) > 0, 'Algolia object ids are numeric HN item ids');
+    }
+  });
 });

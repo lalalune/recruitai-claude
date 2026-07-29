@@ -25,6 +25,7 @@ import path from 'node:path';
 import { OAuth2Client, CodeChallengeMethod } from 'google-auth-library';
 import { gmail, gmail_v1 } from '@googleapis/gmail';
 import { getDb, prep } from '../db/index.js';
+import { redactError, redactSecrets } from './redact.js';
 import type { EventName, RecruitEvents } from '../../shared/ipc.js';
 
 export const GMAIL_SCOPES = [
@@ -159,7 +160,7 @@ const ENC_PREFIX = 'enc:v1:';
 const RAW_PREFIX = 'raw:v1:';
 let warnedAboutPlaintext = false;
 
-async function encryptionAvailable(): Promise<boolean> {
+export async function encryptionAvailable(): Promise<boolean> {
   const e = await electron();
   if (!e?.safeStorage) return false;
   try {
@@ -325,6 +326,12 @@ export function classifyGmailError(err: unknown): Error {
     message = data.error.message ?? message;
   }
 
+  // The converted message reaches three sinks that outlive the process: the
+  // `send.error` column, the renderer, and the log. A transport-level gaxios
+  // message quotes the request URL, which on the token endpoints carries the
+  // credential — scrub once, here, rather than at each sink.
+  message = redactSecrets(message);
+
   const blob = `${reason} ${message}`.toLowerCase();
 
   if (
@@ -409,7 +416,7 @@ export async function getAuthClient(): Promise<OAuth2Client> {
   client.on('tokens', (tokens) => {
     if (!tokens.refresh_token || tokens.refresh_token === refreshToken) return;
     void setSecret(KEY_REFRESH_TOKEN, tokens.refresh_token).catch((err) =>
-      console.warn('[gmail] failed to persist rotated refresh token:', err),
+      console.warn('[gmail] failed to persist rotated refresh token:', redactError(err)),
     );
   });
 
@@ -731,7 +738,9 @@ export async function disconnectGmail(): Promise<void> {
       });
       await client.revokeToken(refreshToken);
     } catch (err) {
-      console.warn('[gmail] token revoke failed (continuing with local disconnect):', err);
+      // revokeToken puts the refresh token in the request URL, and a gaxios
+      // failure carries that URL on the error object — never log it raw.
+      console.warn('[gmail] token revoke failed (continuing with local disconnect):', redactError(err));
     }
   }
 

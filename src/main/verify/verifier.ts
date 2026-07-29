@@ -171,11 +171,16 @@ export interface SpendState {
 export const GLOBAL_CAP_PROVIDER = 'all';
 
 export function syncSpendCap(db: Db, provider: string, capMicros: number): SpendState {
+  // Must UPDATE, not DO NOTHING. commitApiCall seeds a row for an unseen
+  // provider with cap_usd_micros = 0 (it knows the spend, not the ceiling), so
+  // a first charge that lands before this runs would otherwise pin the cap at
+  // zero forever — the Pipeline screen then reports a $0 budget against real
+  // spend. Setting the cap is precisely this function's job.
   run(
     db,
     `INSERT INTO spend_cap (provider, cap_usd_micros, spent_usd_micros)
      VALUES (?, ?, 0)
-     ON CONFLICT(provider) DO NOTHING`,
+     ON CONFLICT(provider) DO UPDATE SET cap_usd_micros = excluded.cap_usd_micros`,
     provider,
     capMicros,
   );
@@ -206,10 +211,27 @@ export function totalSpentMicros(db: Db): number {
   );
 }
 
+/**
+ * Money that is committed to but not yet recorded as spent: rows sitting in
+ * 'reserved'. spend_cap only moves after a call returns, so without this a
+ * crash between reserve and commit — or a second verify run that interleaves at
+ * an await — sees a cap that has quietly forgotten about credits already in
+ * flight, and the ceiling can be walked straight past. Counting reservations is
+ * what makes the cap hold across both a restart and a concurrent run.
+ */
+export function outstandingReservedMicros(db: Db): number {
+  return (
+    get<{ n: number }>(
+      db,
+      `SELECT coalesce(sum(est_cost_micros), 0) AS n FROM api_call WHERE state = 'reserved'`,
+    )?.n ?? 0
+  );
+}
+
 /** Throws rather than returning false — spending money must not be a soft path. */
 export function assertSpendAvailable(db: Db, provider: string, needMicros: number, capMicros: number): void {
   syncSpendCap(db, provider, capMicros);
-  const total = totalSpentMicros(db);
+  const total = totalSpentMicros(db) + outstandingReservedMicros(db);
   if (total + needMicros > capMicros) {
     throw new SpendCapError(provider, total, capMicros);
   }
@@ -243,8 +265,11 @@ interface ApiCallRow {
   id: number;
   state: string;
   http_status: number | null;
+  actual_cost_micros: number | null;
   started_at: number;
 }
+
+const API_CALL_COLUMNS = 'id, state, http_status, actual_cost_micros, started_at';
 
 interface Reservation {
   id: number | null;
@@ -257,15 +282,25 @@ interface Reservation {
  * A previous attempt that provably consumed no credit may reuse its own ledger
  * row rather than forcing the operator to pay for a new key.
  *
- * Providers meter a verification when they return one, so a credit is at risk
- * only on a 2xx. Everything else — a network failure, a timeout, a rejected key,
- * a malformed request, a 5xx, a 429 — never reached the meter. Stating it as
- * "only 2xx may have been charged" is safer than enumerating failure codes,
- * because an unanticipated status falls on the retryable side only when it is
- * outside the success range.
+ * Two independent proofs, either of which is enough:
+ *
+ *  1. The attempt recorded a zero actual cost. Every adapter reports exactly
+ *     which addresses the provider metered (`chargedEmails`), and commit writes
+ *     that through, so a committed 0 is a positive statement that no credit
+ *     moved. This is the case that matters in practice: providers answer
+ *     "invalid API key", "unparseable body" and "no task id" with HTTP 200 and
+ *     an error field, and judging those by status alone locked the address out
+ *     of verification forever — one bad key poisoned every address it touched.
+ *  2. Failing that (a legacy row with no cost recorded), the status is outside
+ *     2xx. Providers meter when they return an answer, so a network failure, a
+ *     timeout, a 5xx or a 429 never reached the meter. Phrasing it as "only a
+ *     2xx may have been charged" is safer than enumerating failure codes: an
+ *     unanticipated status falls on the retryable side only when it is outside
+ *     the success range.
  */
 function noCreditConsumed(row: ApiCallRow): boolean {
   if (row.state !== 'failed') return false;
+  if (row.actual_cost_micros === 0) return true;
   const s = row.http_status;
   return s == null || s < 200 || s >= 300;
 }
@@ -300,7 +335,7 @@ function reserveApiCall(
 
   const existing = get<ApiCallRow>(
     db,
-    'SELECT id, state, http_status, started_at FROM api_call WHERE provider = ? AND idempotency_key = ?',
+    `SELECT ${API_CALL_COLUMNS} FROM api_call WHERE provider = ? AND idempotency_key = ?`,
     args.provider,
     args.key,
   );
@@ -310,6 +345,7 @@ function reserveApiCall(
     run(
       db,
       `UPDATE api_call SET state = 'reserved', error = NULL, http_status = NULL,
+              actual_cost_micros = NULL,
               started_at = unixepoch('subsec')*1000, finished_at = NULL
         WHERE id = ?`,
       existing.id,
@@ -394,6 +430,9 @@ function idempotencyKeyFor(db: Db, provider: string, email: string, force: boole
 
 /** Exposed for tests: key-allocation is where double-charge protection lives. */
 export const __idempotencyKeyForTests = idempotencyKeyFor;
+/** Exposed for tests: so is reserve/commit, which is what survives a crash. */
+export const __reserveApiCallForTests = reserveApiCall;
+export const __commitApiCallForTests = commitApiCall;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Evidence + cache

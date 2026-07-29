@@ -10,28 +10,13 @@
  * last-gate check in gmail/send.ts) uses them.
  */
 
-import { normName } from './ingest.js';
+import { normName, canonicalCompanyValue } from './canon.js';
 import { get, type Db } from '../db/index.js';
 
-/** ULID as emitted by src/main/db/index.ts — uppercase Crockford, 26 chars. */
-const ULID_RE = /^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$/;
-
-/** Something that parses as a bare hostname, e.g. "acme.com". */
-const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
-
-/**
- * Canonical stored form of a company-kind suppression value:
- *   - a ULID     → lowercased (matched back via upper(s.value) = co.id)
- *   - a domain   → lowercased (matched via s.value = lower(co.domain))
- *   - a name     → normName() (matched via s.value = co.name_norm)
- */
-export function canonicalCompanyValue(raw: string): string {
-  const v = raw.trim();
-  if (ULID_RE.test(v)) return v.toLowerCase();
-  if (DOMAIN_RE.test(v)) return v.toLowerCase();
-  const norm = normName(v);
-  return norm || v.toLowerCase();
-}
+// The shaping rules live in canon.ts (a leaf module, so db/index.ts can run
+// the post-migration backfill without an import cycle); re-exported here
+// because every barrier historically imports them from this module.
+export { canonicalCompanyValue } from './canon.js';
 
 /**
  * Shape alone cannot disambiguate "Node.js" (a NAME that looks like a domain,
@@ -65,10 +50,15 @@ export function companySuppressionValues(db: Db, raw: string): string[] {
 
 /**
  * SQL fragment matching a suppression row `s` of kind 'company' against a
- * company row aliased `co`. Assumes s.value is stored canonically (above).
+ * company row aliased `co`. Assumes s.value is stored canonically (above;
+ * migration v3 normalises legacy rows).
+ *
+ * The indexed suppression side stays a BARE column — `s.value = lower(co.id)`
+ * seeks the UNIQUE(kind, value) index, while the old `upper(s.value) = co.id`
+ * degraded every barrier to a per-kind scan (measured 85x on the send path).
  */
 export const COMPANY_SUPPRESSION_MATCH = `(
-  upper(s.value) = co.id
+  s.value = lower(co.id)
   OR s.value = co.name_norm
   OR (co.domain IS NOT NULL AND s.value = lower(co.domain))
 )`;

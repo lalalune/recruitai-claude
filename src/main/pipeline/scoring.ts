@@ -12,6 +12,7 @@
  */
 
 import { all, get, run, tx, type Db } from '../db/index.js';
+import { COMPANY_SUPPRESSION_MATCH } from './suppression.js';
 import { getIcp } from '../settings.js';
 import {
   scoreCompany,
@@ -305,7 +306,18 @@ export function recomputeCompany(db: Db, companyId: string, icp: IcpConfig = get
   const row = get<CompanyRowRaw>(db, 'SELECT * FROM company WHERE id = ?', companyId);
   if (!row) return;
 
-  const reqs = all<ReqRowRaw>(db, 'SELECT * FROM req WHERE company_id = ?', companyId).map(toReqDomain);
+  // description is deliberately NULLed out: scoring never reads it (it is
+  // consumed at ingest), and at a 100k-req corpus hauling JD bodies through
+  // this per-company loop dominated scoreAll's measured runtime.
+  const reqs = all<ReqRowRaw>(
+    db,
+    `SELECT id, company_id, external_id, source, title, department, team, location, is_remote,
+            employment_type, comp_min, comp_max, NULL AS description, url, first_seen_at,
+            last_seen_at, published_at, closed_at, days_open, repost_count, function_family,
+            seniority, no_agency_disclaimer, named_contact
+       FROM req WHERE company_id = ?`,
+    companyId,
+  ).map(toReqDomain);
   const contactRows = all<ContactRowRaw>(db, 'SELECT * FROM contact WHERE company_id = ?', companyId);
   const contacts = contactRows.map(toContactDomain);
 
@@ -385,14 +397,17 @@ export function electPrimaryContact(db: Db, companyId: string): void {
 }
 
 export function isSuppressed(db: Db, companyId: string, domain: string | null): boolean {
+  // The same triple-identity company match every other barrier uses — the old
+  // inline version compared the raw uppercase ULID against lowercased stored
+  // values (never matched) and had no name arm at all, so a name-kind
+  // suppression was invisible to scoring. Suppression-side seeks stay bare;
+  // lower() is applied to the company/parameter side only.
   const row = get<{ n: number }>(
     db,
-    `SELECT count(*) AS n FROM suppression
-      WHERE (kind = 'company' AND (value = ? OR (? IS NOT NULL AND lower(value) = lower(?))))
-         OR (kind = 'domain' AND ? IS NOT NULL AND lower(value) = lower(?))`,
+    `SELECT count(*) AS n FROM suppression s
+      WHERE (s.kind = 'company' AND EXISTS (SELECT 1 FROM company co WHERE co.id = ? AND ${COMPANY_SUPPRESSION_MATCH}))
+         OR (s.kind = 'domain' AND ? IS NOT NULL AND s.value = lower(?))`,
     companyId,
-    domain,
-    domain,
     domain,
     domain,
   );
@@ -420,6 +435,9 @@ export async function scoreAll(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
     });
     done += chunk.length;
     ctx.progress(done, ids.length);
+    // Yield to the event loop between chunks: this loop had zero awaits, so a
+    // 10k-company rescore blocked every IPC handler for the full ~1.3 s.
+    await new Promise<void>((r) => setImmediate(r));
   }
 
   const qualified = get<{ n: number }>(

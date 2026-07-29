@@ -60,7 +60,7 @@ import {
   fieldLabel,
   sourceLabel,
 } from '../lib/format.js';
-import { clamp, cn } from '../lib/utils.js';
+import { clamp, cn, isActivationTarget, isInOverlayLayer } from '../lib/utils.js';
 import {
   FILTER_LABELS,
   FILTER_ORDER,
@@ -101,6 +101,7 @@ export default function Review() {
   const setFilter = useUi((s) => s.setFilter);
   const search = useUi((s) => s.search);
   const setSearch = useUi((s) => s.setSearch);
+  const resetView = useUi((s) => s.resetView);
   const sort = useUi((s) => s.sort);
   const setSort = useUi((s) => s.setSort);
   const cycleSort = useUi((s) => s.cycleSort);
@@ -351,25 +352,46 @@ export default function Review() {
 
   // ── keyboard map ──────────────────────────────────────────────────────────
 
-  const hk = { enabled: !overlayOpen, preventDefault: true } as const;
+  // An open Radix popover (provenance, conflict picker) or dropdown owns the
+  // keyboard; without this, `a`/`x` would decide the record sitting behind it.
+  const hk = {
+    enabled: !overlayOpen,
+    preventDefault: true,
+    ignoreEventWhen: (e: KeyboardEvent) => isInOverlayLayer(e.target),
+  } as const;
 
   useHotkeys('j,down', () => move(1), hk, [move]);
   useHotkeys('k,up', () => move(-1), hk, [move]);
-  useHotkeys('space', () => filtered[focusedIndex] && setSelectedId(filtered[focusedIndex].id), hk, [
-    filtered,
-    focusedIndex,
-    setSelectedId,
-  ]);
+
+  // Space is the one screen hotkey that collides with a native behaviour: it is
+  // how the browser presses a focused button. Swallowing it unconditionally
+  // would make every button on this screen unreachable from the keyboard, so
+  // both the handler and its preventDefault stand down over activatable targets.
+  const spaceIsOurs = useCallback(
+    (e: KeyboardEvent) => !isActivationTarget(e.target) && !isInOverlayLayer(e.target),
+    [],
+  );
+  useHotkeys(
+    'space',
+    () => filtered[focusedIndex] && setSelectedId(filtered[focusedIndex].id),
+    { enabled: (e) => !overlayOpen && spaceIsOurs(e), preventDefault: spaceIsOurs },
+    [filtered, focusedIndex, setSelectedId, overlayOpen, spaceIsOurs],
+  );
   useHotkeys('a', approve, hk, [approve]);
   useHotkeys('x', reject, hk, [reject]);
   useHotkeys('r', toggleReviewed, hk, [toggleReviewed]);
   useHotkeys('c', compose, hk, [compose]);
   useHotkeys('f', findMore, hk, [findMore]);
   useHotkeys('v', reverify, hk, [reverify]);
-  useHotkeys('g', () => detail?.screenshots.length && setLightboxIndex(0), hk, [
-    detail,
-    setLightboxIndex,
-  ]);
+  useHotkeys(
+    'g',
+    () => {
+      if (detail?.screenshots.length) setLightboxIndex(0);
+      else if (detail) toast.info('No evidence captured for this company yet');
+    },
+    hk,
+    [detail, setLightboxIndex],
+  );
   useHotkeys('s', cycleSort, hk, [cycleSort]);
   useHotkeys('mod+z', undo, { ...hk, enableOnFormTags: false }, [undo]);
 
@@ -505,13 +527,11 @@ export default function Review() {
     const ids = [...marked];
     if (!ids.length) return;
     const prev = snapshotStatuses(ids);
+    const label = `${plural(ids.length, 'company', 'companies')} ${status}`;
     bulkStatus({ ids, status });
-    pushUndo({
-      label: `${ids.length} companies ${status}`,
-      run: () => restoreStatuses(prev),
-    });
+    pushUndo({ label, run: () => restoreStatuses(prev) });
     clearMarked();
-    toast.success(`${ids.length} companies ${status}`);
+    toast.success(label);
   };
 
   const suppressMarked = async () => {
@@ -693,16 +713,9 @@ export default function Review() {
             <EmptyState
               icon={<Search />}
               title="Nothing matches this view"
-              description="Try a different filter, or clear the search."
+              description="Try a different filter, drop a toggle, or clear the search."
               action={
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => {
-                    setSearch('');
-                    setFilter('all');
-                  }}
-                >
+                <Button size="sm" variant="outline" onClick={resetView}>
                   Reset filters
                 </Button>
               }

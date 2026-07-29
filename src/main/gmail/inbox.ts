@@ -46,6 +46,7 @@ import {
   extractMessageIds,
   type DeliveryStatusRecipient,
 } from './mime.js';
+import { redactError } from './redact.js';
 
 /** Ceiling on messages examined in one sync, so a long absence can't stall the UI. */
 const MAX_MESSAGES_PER_SYNC = 500;
@@ -284,7 +285,7 @@ async function fetchMessages(
           fatal = err;
           return;
         }
-        console.warn(`[gmail] could not fetch message ${id}:`, err);
+        console.warn(`[gmail] could not fetch message ${id}:`, redactError(err));
       }
     }
   });

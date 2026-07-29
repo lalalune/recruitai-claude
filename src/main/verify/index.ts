@@ -64,6 +64,7 @@ export {
   assertSpendAvailable,
   estimateVerifyCostUsd,
   loadVerifierConfig,
+  outstandingReservedMicros,
   spendSummary,
   syncSpendCap,
   testVerifierKey,

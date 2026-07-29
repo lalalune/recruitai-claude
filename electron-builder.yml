@@ -1,10 +1,11 @@
 appId: com.recruitai.app
 productName: recruitAI
-copyright: Copyright © 2026 Shaw Walters
+copyright: Copyright © 2026 Shaw Walters. Licensed under Apache-2.0.
 asar: true
 
 directories:
   output: release
+  buildResources: build
 
 # Only the two runtime trees. `dist/**` also swept in dist/tests/*.cjs,
 # dist/seed.cjs and dist/smoke.cjs, which are build artifacts of the test
@@ -24,7 +25,19 @@ files:
   - "!**/*.map"
   - "!node_modules/**"
 
+# Apache-2.0 §4(a) requires recipients of the binaries receive the License, and
+# §4(d) requires propagating third-party NOTICE content. Shipping these three
+# files alongside the app is how the packaged build satisfies that.
+extraResources:
+  - from: LICENSE
+    to: LICENSE
+  - from: NOTICE
+    to: NOTICE
+  - from: THIRD-PARTY-LICENSES.md
+    to: THIRD-PARTY-LICENSES.md
+
 mac:
+  icon: build/icon.icns
   category: public.app-category.productivity
   darkModeSupport: true
   # Unsigned. Gatekeeper will quarantine the download; the README documents the
@@ -38,6 +51,7 @@ mac:
       arch: [arm64, x64]
 
 win:
+  icon: build/icon.ico
   target:
     - target: nsis
       arch: [x64, arm64]
@@ -48,6 +62,7 @@ nsis:
   perMachine: false
 
 linux:
+  icon: build/icon.png
   category: Office
   target:
     - target: AppImage

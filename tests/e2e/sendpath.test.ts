@@ -250,6 +250,46 @@ describe('sendOne against the fake gateway', () => {
     assert.equal(get<{ state: string }>(db, 'SELECT state FROM draft WHERE id = ?', draftId)!.state, 'skipped');
   });
 
+  test('the daily cap is exact under concurrency: one slot admits one send', async () => {
+    const db = getDb();
+    const a = seed(db, 'capa');
+    const b = seed(db, 'capb');
+    // Exactly one slot left today — measured with the SAME today-bounded
+    // predicate the claim uses (an earlier test seeds a 3-day-old send that
+    // must not count).
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const already = get<{ n: number }>(
+      db,
+      `SELECT count(*) AS n FROM send
+        WHERE (sent_at >= ? AND outcome != 'failed') OR (outcome = 'pending' AND created_at >= ?)`,
+      startOfDay.getTime(),
+      startOfDay.getTime(),
+    )!.n;
+    await patchSettings({ sending: { perDay: already + 1, perHour: 200 } });
+
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const { gateway, requests } = fakeGateway(() => gate);
+      __setSendGatewayForTests(gateway);
+
+      const [ra, rb] = [sendOne(db, a.draftId), sendOne(db, b.draftId)];
+      await new Promise((r) => setTimeout(r, 20));
+      release();
+      const results = await Promise.all([ra, rb]);
+
+      assert.equal(requests.length, 1, 'the in-claim cap re-check admits exactly one message');
+      assert.equal(results.filter((r) => r.ok).length, 1);
+      const blocked = results.find((r) => !r.ok)!;
+      assert.match(!blocked.ok ? blocked.reason : '', /limit reached/i);
+    } finally {
+      // An assertion failure above must not leave a 1-ish perDay behind for
+      // the breaker test — that cascade cost a debugging round once already.
+      await patchSettings({ sending: { perDay: 500 } });
+    }
+  });
+
   // LAST on purpose: it floods the trailing-50 outcome window.
   test('the bounce circuit breaker trips before another message leaves', async () => {
     const db = getDb();

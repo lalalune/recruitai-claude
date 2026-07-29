@@ -100,8 +100,11 @@ async function drainOnce(): Promise<void> {
 export function startDrainer(): void {
   if (timer) return;
   // A task left 'running' by a crash would otherwise never be picked up again.
+  // Floor 0: the single-instance lock means nothing can genuinely be running,
+  // and a 30-minute floor left quick-relaunch tasks wedged (their dedupe keys
+  // then blocked re-enqueueing the same work).
   try {
-    const requeued = requeueStale(getDb());
+    const requeued = requeueStale(getDb(), 0);
     if (requeued > 0) appendLog('pipeline', 'warn', `Requeued ${requeued} task(s) interrupted by a previous exit.`);
   } catch {
     /* the database may not be ready yet; the first tick will cover it */

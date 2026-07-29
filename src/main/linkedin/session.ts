@@ -128,6 +128,20 @@ function installGuards(ses: Session): void {
   if (guardsInstalled) return;
   guardsInstalled = true;
 
+  // Electron grants every permission request by default and never prompts. The
+  // windows on this partition load live third-party pages, so camera, mic,
+  // geolocation, notifications and clipboard-read would all be handed to
+  // whatever those pages (or anything embedded in them) asks for. Nothing this
+  // module does needs a single one. The typeof guards keep the module loadable
+  // against a partial `session` shim, which is the same tolerance the rest of
+  // the file already shows toward running outside a full Electron runtime.
+  if (typeof ses.setPermissionRequestHandler === 'function') {
+    ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+  }
+  if (typeof ses.setPermissionCheckHandler === 'function') {
+    ses.setPermissionCheckHandler(() => false);
+  }
+
   const filter = { urls: ['*://*.linkedin.com/*'] };
 
   ses.webRequest.onCompleted(filter, (details) => {

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useHotkeys } from 'react-hotkeys-hook';
 import { toast } from 'sonner';
 import {
+  AlertTriangle,
   ExternalLink,
   Inbox,
   Mail,
@@ -42,6 +43,7 @@ import { NumberInput, useSettings, useSettingsPatch } from './Settings.js';
 
 const TAB_STORE = 'recruitai.outreach.tab';
 const DRAFTS_KEY = ['drafts', 'draft'] as const;
+const FAILED_KEY = ['drafts', 'failed'] as const;
 const QUEUE_KEY = ['drafts', 'queued'] as const;
 const STATS_KEY = ['sendStats'] as const;
 
@@ -61,7 +63,7 @@ export function Outreach() {
     safeLocalSet(TAB_STORE, tab);
   }, [tab]);
 
-  const { data: stats } = useQuery({ queryKey: STATS_KEY, queryFn: () => api.getSendStats(), refetchInterval: 1000 });
+  const { data: stats } = useQuery({ queryKey: STATS_KEY, queryFn: () => api.getSendStats(), refetchInterval: 5000 });
   const { data: drafts } = useQuery({ queryKey: DRAFTS_KEY, queryFn: () => api.listDrafts('draft') });
   const { data: inbound } = useQuery({ queryKey: ['inbound', false], queryFn: () => api.listInbound(false) });
 
@@ -118,7 +120,20 @@ export function Outreach() {
 function DraftsTab({ active }: { active: boolean }) {
   const qc = useQueryClient();
   const overlayOpen = useOverlayOpen();
-  const { data: drafts = [], isLoading } = useQuery({ queryKey: DRAFTS_KEY, queryFn: () => api.listDrafts('draft') });
+  const {
+    data: drafts = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({ queryKey: DRAFTS_KEY, queryFn: () => api.listDrafts('draft') });
+  // Crash-interrupted sends land in 'failed' (reconcileInterruptedSends). They
+  // were surfaced NOWHERE — a crash mid-send made that draft vanish from every
+  // screen while the unique active-draft index blocked its contact forever.
+  const { data: failedDrafts = [] } = useQuery({
+    queryKey: FAILED_KEY,
+    queryFn: () => api.listDrafts('failed'),
+  });
 
   const items = useMemo(
     () =>
@@ -350,7 +365,64 @@ function DraftsTab({ active }: { active: boolean }) {
   useHotkeys('x', () => void act('reject'), { enabled }, [act, enabled]);
   useHotkeys('n', () => advance(), { enabled }, [advance, enabled]);
 
+  const requeueFailed = useMutation({
+    mutationFn: (id: string) => api.queueDraft(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['drafts'] });
+      toast.success('Requeued', { description: 'Check Gmail Sent first — an interrupted send may already have gone out.' });
+    },
+    onError: (e: Error) => toast.error('Could not requeue', { description: e.message }),
+  });
+  const discardFailed = useMutation({
+    mutationFn: (id: string) => api.skipDraft(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['drafts'] }),
+    onError: (e: Error) => toast.error('Could not discard', { description: e.message }),
+  });
+
+  const failedStrip =
+    failedDrafts.length === 0 ? null : (
+      <div className="border-b border-red-500/30 bg-red-500/5 px-3 py-2 text-xs">
+        <div className="mb-1 font-medium text-red-600 dark:text-red-400">
+          {failedDrafts.length} failed send{failedDrafts.length === 1 ? '' : 's'} — interrupted before Gmail
+          confirmed. Check Gmail Sent before requeueing.
+        </div>
+        <ul className="space-y-1">
+          {failedDrafts.slice(0, 5).map((d) => (
+            <li key={d.id} className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate">
+                {d.companyName} · {d.contactName}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-xs"
+                disabled={requeueFailed.isPending}
+                onClick={() => requeueFailed.mutate(d.id)}
+              >
+                Requeue
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-xs"
+                disabled={discardFailed.isPending}
+                onClick={() => discardFailed.mutate(d.id)}
+              >
+                Discard
+              </Button>
+            </li>
+          ))}
+          {failedDrafts.length > 5 && (
+            <li className="text-muted-foreground">…and {failedDrafts.length - 5} more</li>
+          )}
+        </ul>
+      </div>
+    );
+
   const left = (
+    <div className="flex h-full min-h-0 flex-col">
+      {failedStrip}
+      <div className="min-h-0 flex-1">
     <RankedList
       items={items}
       selectedId={selectedId}
@@ -376,13 +448,26 @@ function DraftsTab({ active }: { active: boolean }) {
         />
       )}
       emptyState={
-        <EmptyState
-          icon={<Mail className="h-6 w-6" />}
-          title={isLoading ? 'Loading drafts…' : 'No drafts waiting'}
-          description="Approving a company in Review queues its first draft; it appears here shortly after approval."
-        />
+        isError ? (
+          // "No drafts waiting" over a failed query reads as "you have nothing
+          // to do", which is the opposite of the truth.
+          <EmptyState
+            icon={<MailX className="h-6 w-6" />}
+            title="Could not load drafts"
+            description={String((error as Error)?.message ?? '')}
+            action={{ label: 'Try again', onClick: () => void refetch() }}
+          />
+        ) : (
+          <EmptyState
+            icon={<Mail className="h-6 w-6" />}
+            title={isLoading ? 'Loading drafts…' : 'No drafts waiting'}
+            description="Approving a company in Review queues its first draft; it appears here shortly after approval."
+          />
+        )
       }
     />
+      </div>
+    </div>
   );
 
   const right = selected ? (
@@ -509,7 +594,13 @@ function PerformanceStrip() {
 
 function SentTab({ onOpenDrafts }: { onOpenDrafts(): void }) {
   const qc = useQueryClient();
-  const { data: rows = [], isLoading } = useQuery({
+  const {
+    data: rows = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ['sent'],
     queryFn: () => api.listSent(),
     refetchInterval: 60_000,
@@ -529,6 +620,16 @@ function SentTab({ onOpenDrafts }: { onOpenDrafts(): void }) {
   });
 
   if (isLoading) return <div className="p-8 text-sm text-muted-foreground">Loading sent messages…</div>;
+  if (isError) {
+    return (
+      <EmptyState
+        icon={<MailX className="h-6 w-6" />}
+        title="Could not load sent messages"
+        description={String((error as Error)?.message ?? '')}
+        action={{ label: 'Try again', onClick: () => void refetch() }}
+      />
+    );
+  }
   if (rows.length === 0) {
     return (
       <EmptyState
@@ -595,8 +696,13 @@ function QueueTab() {
   const patch = useSettingsPatch();
   const overlayOpen = useOverlayOpen();
   const { data: settings } = useSettings();
-  const { data: stats } = useQuery({ queryKey: STATS_KEY, queryFn: () => api.getSendStats(), refetchInterval: 1000 });
-  const { data: queue = [] } = useQuery({
+  const { data: stats } = useQuery({ queryKey: STATS_KEY, queryFn: () => api.getSendStats(), refetchInterval: 5000 });
+  const {
+    data: queue = [],
+    isError: queueFailed,
+    error: queueError,
+    refetch: refetchQueue,
+  } = useQuery({
     queryKey: QUEUE_KEY,
     queryFn: () => api.listDrafts('queued'),
     refetchInterval: 5000,
@@ -711,7 +817,9 @@ function QueueTab() {
               <span className="mx-2 text-muted-foreground">·</span>
               <span className="text-muted-foreground">
                 {!stats.running
-                  ? 'paused'
+                  ? stats.pausedReason
+                    ? 'paused automatically'
+                    : 'paused'
                   : !stats.inWindow
                     ? `outside window (${stats.windowStart}–${stats.windowEnd})`
                     : countdown == null
@@ -748,6 +856,16 @@ function QueueTab() {
         </div>
       </header>
 
+      {/* The sender can stop itself (bounce circuit breaker). Reporting only
+          "paused" would leave the operator pressing Start against a reason they
+          cannot see, so the reason main recorded is shown verbatim. */}
+      {stats?.pausedReason && !stats.running && (
+        <div className="flex items-start gap-2 border-b border-border bg-red-500/10 px-6 py-2 text-xs text-red-700 dark:text-red-300">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{stats.pausedReason}</span>
+        </div>
+      )}
+
       {!settings?.gmail.connected && (
         <div className="border-b border-border bg-amber-500/10 px-6 py-2 text-xs text-amber-700 dark:text-amber-300">
           Gmail is not connected — nothing will send until you connect it in Settings.
@@ -758,11 +876,22 @@ function QueueTab() {
         <div className="min-h-0 overflow-y-auto">
           {ordered.length === 0 ? (
             <div className="p-8">
-              <EmptyState
-                icon={<Inbox className="h-6 w-6" />}
-                title="The queue is empty"
-                description="Queue drafts from the Drafts tab and they will send on the paced timer."
-              />
+              {queueFailed ? (
+                // "The queue is empty" over a failed read would tell the
+                // operator nothing is pending while sends are in fact waiting.
+                <EmptyState
+                  icon={<MailX className="h-6 w-6" />}
+                  title="Could not load the queue"
+                  description={String((queueError as Error)?.message ?? '')}
+                  action={{ label: 'Try again', onClick: () => void refetchQueue() }}
+                />
+              ) : (
+                <EmptyState
+                  icon={<Inbox className="h-6 w-6" />}
+                  title="The queue is empty"
+                  description="Queue drafts from the Drafts tab and they will send on the paced timer."
+                />
+              )}
             </div>
           ) : (
             <ol className="divide-y divide-border">
@@ -901,7 +1030,13 @@ function RepliesTab({ active, onOpenDrafts }: { active: boolean; onOpenDrafts():
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [bounceOffer, setBounceOffer] = useState<{ company: CompanyDetail; contact: ContactRow } | null>(null);
 
-  const { data: rows = [], isLoading } = useQuery({
+  const {
+    data: rows = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ['inbound', showHandled],
     queryFn: () => (showHandled ? api.listInbound() : api.listInbound(false)),
     refetchInterval: 30_000,
@@ -942,15 +1077,46 @@ function RepliesTab({ active, onOpenDrafts }: { active: boolean; onOpenDrafts():
       const row = selected;
       const next = items[index + 1] ?? items[index - 1] ?? null;
       try {
-        await api.markInbound(row.id, action);
+        const result = await api.markInbound(row.id, action);
         if (action === 'positive') {
           toast.success(`Marked positive — ${row.companyName ?? row.fromEmail}`, {
             description: 'Follow up from here; the company is flagged as replied.',
           });
         } else if (action === 'negative') {
-          toast.success('Marked negative', { description: 'The domain is suppressed — no further outreach.' });
+          // Tell the truth about scope: the freemail carve-out suppresses the
+          // ADDRESS only, and one keystroke here is otherwise irreversible —
+          // the Undo removes exactly the suppression rows this action created
+          // (contact/company stay marked; fix those from their own screens).
+          const sup = result.suppressed;
+          toast.success('Marked negative', {
+            description:
+              sup == null
+                ? 'No linked send — nothing was suppressed.'
+                : sup.kind === 'email'
+                  ? `Only ${sup.value} is suppressed (freemail — the domain stays open).`
+                  : `The ${sup.value} domain is suppressed — no further outreach.`,
+            action: sup
+              ? {
+                  label: 'Undo',
+                  onClick: () => {
+                    void Promise.all(sup.ids.map((sid) => api.removeSuppression(sid)))
+                      .then(() => {
+                        qc.invalidateQueries();
+                        toast.success('Suppression removed', {
+                          description: 'The contact still shows rejected — edit it directly if that was a slip.',
+                        });
+                      })
+                      .catch((e) => toast.error('Could not undo', { description: (e as Error).message }));
+                  },
+                }
+              : undefined,
+          });
         } else if (action === 'bounce') {
-          toast.success('Bounce confirmed', { description: 'The address is marked invalid.' });
+          toast.success('Bounce confirmed', {
+            description: result.suppressed
+              ? `${result.suppressed.value} is marked invalid and suppressed.`
+              : 'The address is marked invalid.',
+          });
           if (row.companyId) {
             const detail = await api.getCompany(row.companyId);
             const alt = detail?.contacts.find(
@@ -1042,12 +1208,21 @@ function RepliesTab({ active, onOpenDrafts }: { active: boolean; onOpenDrafts():
             />
           )}
           emptyState={
-            <EmptyState
-              icon={<Inbox className="h-6 w-6" />}
-              title={isLoading ? 'Loading…' : showHandled ? 'Nothing here yet' : 'No unhandled replies'}
-              description="Replies, bounces and auto-responses land here once the inbox is synced."
-              action={{ label: 'Sync inbox', onClick: () => sync.mutate() }}
-            />
+            isError ? (
+              <EmptyState
+                icon={<MailX className="h-6 w-6" />}
+                title="Could not load replies"
+                description={String((error as Error)?.message ?? '')}
+                action={{ label: 'Try again', onClick: () => void refetch() }}
+              />
+            ) : (
+              <EmptyState
+                icon={<Inbox className="h-6 w-6" />}
+                title={isLoading ? 'Loading…' : showHandled ? 'Nothing here yet' : 'No unhandled replies'}
+                description="Replies, bounces and auto-responses land here once the inbox is synced."
+                action={{ label: 'Sync inbox', onClick: () => sync.mutate() }}
+              />
+            )
           }
         />
       </div>
