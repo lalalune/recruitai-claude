@@ -75,7 +75,7 @@ export function countdown(ms: number | null | undefined): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-function toMillis(at: number | string | null | undefined): number | null {
+export function toMillis(at: number | string | null | undefined): number | null {
   if (at == null) return null;
   if (typeof at === 'number') {
     if (!Number.isFinite(at) || at === 0) return null;

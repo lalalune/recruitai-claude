@@ -293,7 +293,7 @@ export function generateCandidates(
   firstName: string | null,
   lastName: string | null,
   domain: string,
-  pattern: EmailPattern | null,
+  pattern: EmailPattern | null = null,
   opts: { limit?: number; confidence?: number; order?: EmailPattern[] } = {},
 ): Candidate[] {
   const limit = opts.limit ?? 5;

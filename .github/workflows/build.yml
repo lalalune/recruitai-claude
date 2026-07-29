@@ -14,15 +14,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # upload-artifact matches paths with @actions/glob, which has no brace
+          # expansion — `release/*.{dmg,zip}` matches nothing and if-no-files-found
+          # fails the job. Multiple extensions go on separate lines instead.
           - os: macos-latest
             script: dist:mac
-            artifact: release/*.{dmg,zip}
+            artifact: |
+              release/*.dmg
+              release/*.zip
           - os: windows-latest
             script: dist:win
             artifact: release/*.exe
           - os: ubuntu-latest
             script: dist:linux
-            artifact: release/*.{AppImage,deb}
+            artifact: |
+              release/*.AppImage
+              release/*.deb
 
     runs-on: ${{ matrix.os }}
 

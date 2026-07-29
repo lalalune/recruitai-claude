@@ -125,7 +125,11 @@ export interface HnPosting {
 }
 
 export async function listWhoIsHiringThreads(limit = 12): Promise<HnHit[]> {
-  const url = `https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=${limit * 2}`;
+  // whoishiring posts three stories a month ("Who is hiring?", "Who wants to
+  // be hired?", "Freelancer?"), so N months of hiring threads sit in ~3N
+  // stories — plus margin for the occasional extra post. limit*2 quietly
+  // starved the back half of the twelve-month window run.ts advertises.
+  const url = `https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=${limit * 3 + 6}`;
   const data = await httpJson<{ hits: HnHit[] }>(url);
   if (!data?.hits) return [];
   return data.hits.filter((h) => /who is hiring/i.test(h.title)).slice(0, limit);

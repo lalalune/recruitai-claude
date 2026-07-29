@@ -4,9 +4,14 @@
  * The test bundle marks `electron` external (see scripts/run-tests.mjs), so any
  * `require('electron')` inside the app graph reaches the real loader and throws
  * MODULE_NOT_FOUND — Electron's binding only exists inside the Electron runtime.
- * Patching `Module._load` is the only interception point that also covers the
- * dynamic `await import('electron')` in gmail/oauth.ts and linkedin/session.ts,
- * because esbuild lowers those to `require()` too.
+ * Patching `Module._load` intercepts every such require.
+ *
+ * NOTE: a native dynamic `await import('electron')` is NOT intercepted —
+ * esbuild preserves it as real ESM import in CJS output, which resolves the
+ * electron npm package (a path string) and bypasses this stub entirely. The
+ * lazy loaders in gmail/oauth.ts, linkedin/session.ts and linkedin/extract.ts
+ * therefore use createRequire/ambient require first; keep any new lazy
+ * electron loader on the require path too.
  *
  * IMPORT THIS FIRST. esbuild concatenates modules in import order, so the patch
  * is only in place before the app's `require("electron")` runs if this module is
@@ -199,6 +204,7 @@ const fakeApp = {
   getAppPath: () => stubDataDir,
   getName: () => 'recruitai',
   getVersion: () => '0.0.0-test',
+  requestSingleInstanceLock: () => true,
   setName: (_name: string) => undefined,
   quit: () => undefined,
   exit: (_code?: number) => undefined,

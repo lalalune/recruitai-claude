@@ -5,53 +5,35 @@
  * A full sweep is measured in minutes; holding an IPC promise open for that long
  * would make the renderer look hung, and progress already streams over
  * 'pipeline:progress' and 'pipeline:log'.
+ *
+ * Argument validation lives in src/shared/schemas.ts (sourceKeySchema), applied
+ * by the guarded `handle` — no second key list here to drift out of sync.
  */
 
-import { ipcMain } from 'electron';
+import { handle } from './guard.js';
 import { appendLog, getPipelineState, runAll, runSource, setSourceEnabled, stopPipeline } from '../pipeline/run.js';
 import type { SourceKey } from '../../shared/ipc.js';
 
-const VALID_KEYS = new Set<SourceKey>([
-  'yc',
-  'ats_sweep',
-  'careers_crawl',
-  'hn_whoishiring',
-  'sec_formd',
-  'linkedin',
-  'contact_discovery',
-  'email_verify',
-  'scoring',
-  'draft_generation',
-]);
-
-function assertKey(key: unknown): SourceKey {
-  if (typeof key !== 'string' || !VALID_KEYS.has(key as SourceKey)) {
-    throw new Error(`Unknown pipeline source: ${String(key)}`);
-  }
-  return key as SourceKey;
-}
-
 export function registerPipelineIpc(): void {
-  ipcMain.handle('getPipeline', async () => getPipelineState());
+  handle('getPipeline', async () => getPipelineState());
 
-  ipcMain.handle('runSource', async (_e, key: SourceKey) => {
-    const source = assertKey(key);
-    void runSource(source).catch((err) => {
-      appendLog(source, 'error', err instanceof Error ? err.message : String(err));
+  handle('runSource', async (key: SourceKey) => {
+    void runSource(key).catch((err) => {
+      appendLog(key, 'error', err instanceof Error ? err.message : String(err));
     });
   });
 
-  ipcMain.handle('runAll', async () => {
+  handle('runAll', async () => {
     void runAll().catch((err) => {
       appendLog('pipeline', 'error', err instanceof Error ? err.message : String(err));
     });
   });
 
-  ipcMain.handle('stopPipeline', async () => {
+  handle('stopPipeline', async () => {
     stopPipeline();
   });
 
-  ipcMain.handle('setSourceEnabled', async (_e, key: SourceKey, enabled: boolean) => {
-    setSourceEnabled(assertKey(key), enabled === true);
+  handle('setSourceEnabled', async (key: SourceKey, enabled: boolean) => {
+    setSourceEnabled(key, enabled);
   });
 }

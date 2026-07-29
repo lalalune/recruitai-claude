@@ -246,6 +246,56 @@ describe('main ↔ renderer', () => {
     await assert.rejects(() => invokeHandler('openExternal', 'javascript:alert(1)'));
   });
 
+  /**
+   * The schemas in src/shared/schemas.ts once existed as fully-tested dead
+   * code: every handler was registered through raw ipcMain.handle and never
+   * consulted them. These two tests make that failure mode impossible to
+   * reintroduce silently.
+   */
+  test('every channel rejects an over-arity call — proves the guard wraps it', async () => {
+    for (const [channel] of registeredHandlers) {
+      await assert.rejects(
+        () => invokeHandler(channel, ...Array<string>(9).fill('junk')),
+        /Invalid arguments|Unknown IPC channel/,
+        `${channel} accepted 9 junk arguments — is it registered through guard.handle()?`,
+      );
+    }
+  });
+
+  test('validation rejects garbage before it reaches a handler', async () => {
+    // Wrong types must die at the boundary with a readable message, not
+    // surface as "Unknown company: 123" from a database lookup.
+    await assert.rejects(
+      () => invokeHandler('patchCompany', 123, 'not-a-patch'),
+      /Invalid arguments for "patchCompany"/,
+    );
+    await assert.rejects(
+      () => invokeHandler('runSource', 'not-a-source'),
+      /Invalid arguments for "runSource"/,
+    );
+    await assert.rejects(
+      () => invokeHandler('addSuppression', 'domain', 'example.com', 'no_agency'),
+      /Invalid arguments for "addSuppression"/,
+      'the pre-rename suppression reason must be rejected by the schema',
+    );
+    await assert.rejects(
+      () => invokeHandler('getScreenshot', '../../../etc/passwd'),
+      /Invalid arguments for "getScreenshot"/,
+    );
+  });
+
+  test('no ipc module bypasses the validating guard', () => {
+    const dir = path.join(ROOT, 'src', 'main', 'ipc');
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith('.ts') || file === 'guard.ts') continue;
+      const src = stripComments(readSource(path.join('src', 'main', 'ipc', file)));
+      assert.ok(
+        !src.includes('ipcMain.handle('),
+        `${file} calls ipcMain.handle directly — register through guard.handle() so the schema applies`,
+      );
+    }
+  });
+
   test('registerIpc is re-entrant', () => {
     // ipcMain.handle throws on a duplicate channel (the stub reproduces that),
     // so this only passes if registerIpc removes every channel it registers.

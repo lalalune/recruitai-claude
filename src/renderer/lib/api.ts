@@ -17,7 +17,7 @@ import {
   type QueryClient,
   type UseQueryOptions,
 } from '@tanstack/react-query';
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { toast } from 'sonner';
 
 import type {
@@ -28,19 +28,13 @@ import type {
   ContactPatch,
   ContactRow,
   DashboardStats,
-  DraftRow,
   EventName,
-  InboundRow,
   LinkedInStatus,
-  PipelineState,
   RecruitApi,
   RecruitEvents,
   SendStats,
-  Settings,
-  SettingsPatch,
-  SourceKey,
-  SuppressionRow,
 } from '../../shared/ipc.js';
+import { createEntityDebouncer, invalidationKeysFor } from './events.js';
 
 /** The preload also exposes an event subscription helper alongside the API. */
 export type EventBridge = {
@@ -99,11 +93,44 @@ export function subscribe<E extends EventName>(
   return typeof off === 'function' ? off : () => {};
 }
 
-export function useAppEvent<E extends EventName>(
-  event: E,
-  cb: (payload: RecruitEvents[E]) => void,
-): void {
-  useEffect(() => subscribe(event, cb), [event, cb]);
+/**
+ * The one place main→renderer events become query updates. Mounted once in App.
+ *
+ * - `data:changed` marks the affected queries stale, coalesced per entity so a
+ *   pipeline burst becomes one refetch instead of hundreds (see lib/events.ts
+ *   for the mapping and the hot-path rules it preserves).
+ * - `send:progress` carries the fresh SendStats payload, so it is written into
+ *   the cache directly — no refetch round-trip.
+ * - `gmail:needs-reauth` surfaces a toast; sending is halted on the main side
+ *   until the operator reconnects in Settings.
+ */
+export function useAppEventBridge(opts?: { onOpenSettings?: () => void }): void {
+  const qc = useQueryClient();
+  const onOpenSettings = opts?.onOpenSettings;
+  useEffect(() => {
+    const debouncer = createEntityDebouncer((entity, ids) => {
+      for (const key of invalidationKeysFor(entity, ids)) {
+        void qc.invalidateQueries({ queryKey: key as unknown as readonly unknown[] });
+      }
+    });
+    const offs = [
+      subscribe('data:changed', (p) => debouncer.push(p.entity, p.id)),
+      subscribe('send:progress', (stats) => qc.setQueryData<SendStats>(qk.sendStats, stats)),
+      subscribe('gmail:needs-reauth', ({ address }) => {
+        void qc.invalidateQueries({ queryKey: qk.settings });
+        toast.error('Gmail needs to be reconnected', {
+          id: 'gmail-needs-reauth',
+          duration: 10_000,
+          description: `${address ?? 'Your account'} lost authorization — nothing will send. Reconnect in Settings.`,
+          action: onOpenSettings ? { label: 'Open Settings', onClick: onOpenSettings } : undefined,
+        });
+      }),
+    ];
+    return () => {
+      debouncer.dispose();
+      for (const off of offs) off();
+    };
+  }, [qc, onOpenSettings]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +171,26 @@ export function useCompanies() {
     gcTime: Infinity,
     refetchOnWindowFocus: false,
   });
+}
+
+/**
+ * Server-side search ids, debounced by react-query's key change. The client
+ * filter stays instant (it never waits on IPC); this AUGMENTS it with matches
+ * the rows can't see — contact names/emails and req titles (FTS5) live only
+ * in the main process. Union of both sets is what the operator perceives as
+ * "search everything", per UX.md §5.2.
+ */
+export function useServerSearchIds(search: string): Set<string> | null {
+  const term = search.trim();
+  const { data } = useQuery({
+    queryKey: ['companies', 'search', term],
+    queryFn: () => api.listCompanies({ search: term, limit: 1_000_000 }),
+    enabled: term.length >= 2,
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
+    placeholderData: (prev) => prev,
+  });
+  return useMemo(() => (term.length >= 2 && data ? new Set(data.map((r) => r.id)) : null), [term, data]);
 }
 
 export function useCompany(id: string | null) {
@@ -484,26 +531,27 @@ export function useVerifyContact() {
 export function useGenerateDraft() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ companyId, contactId }: { companyId: string; contactId?: string }) =>
-      api.generateDraft(companyId, contactId),
-    onSuccess: (draft: DraftRow) => {
-      qc.setQueryData<DraftRow[]>(qk.drafts(), (rows) =>
-        rows ? [draft, ...rows.filter((d) => d.id !== draft.id)] : rows,
-      );
+    // `force` is the explicit Regenerate; a plain compose omits it so the
+    // main-side guards (edited draft, already sent, mid-send, active
+    // follow-up) can refuse with operator guidance.
+    mutationFn: ({
+      companyId,
+      contactId,
+      force,
+    }: {
+      companyId: string;
+      contactId?: string;
+      force?: boolean;
+    }) => api.generateDraft(companyId, contactId, force),
+    onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['drafts'] });
     },
     onError: (err) =>
+      // Guard rejections are operator guidance (e.g. "use Follow up on the
+      // Sent tab"), so the message is surfaced verbatim as the description.
       toast.error('Draft generation failed', {
         description: String((err as Error).message ?? err),
       }),
-  });
-}
-
-export function useDrafts(state?: string) {
-  return useQuery({
-    queryKey: qk.drafts(state),
-    queryFn: () => api.listDrafts(state),
-    staleTime: 10_000,
   });
 }
 
@@ -524,33 +572,9 @@ export function useSendStats() {
   });
 }
 
-export function usePipeline() {
-  return useQuery<PipelineState>({
-    queryKey: qk.pipeline,
-    queryFn: () => api.getPipeline(),
-    staleTime: 5_000,
-  });
-}
-
-export function useRunSource() {
-  return useMutation({
-    mutationFn: (key: SourceKey) => api.runSource(key),
-    onError: (err) =>
-      toast.error('Source failed to start', {
-        description: String((err as Error).message ?? err),
-      }),
-  });
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // LinkedIn
 // ─────────────────────────────────────────────────────────────────────────────
-
-
-
-// The proxy forwards any method name straight to the preload, so this is a
-// type-level statement only. It exists because RecruitApi does not declare the
-// three LinkedIn methods yet, and remains correct once it does.
 
 /**
  * When the stop expires. The main side halts for the remainder of the local day
@@ -608,42 +632,6 @@ export function useDisconnectLinkedIn() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-export function useInbound(handled?: boolean) {
-  return useQuery<InboundRow[]>({
-    queryKey: qk.inbound(handled),
-    queryFn: () => api.listInbound(handled),
-    staleTime: 15_000,
-  });
-}
-
-export function useSettings() {
-  return useQuery<Settings>({
-    queryKey: qk.settings,
-    queryFn: () => api.getSettings(),
-    staleTime: 60_000,
-  });
-}
-
-export function usePatchSettings() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (patch: SettingsPatch) => api.patchSettings(patch),
-    onSuccess: (s) => qc.setQueryData(qk.settings, s),
-    onError: (err) =>
-      toast.error('Could not save settings', {
-        description: String((err as Error).message ?? err),
-      }),
-  });
-}
-
-export function useSuppressions() {
-  return useQuery<SuppressionRow[]>({
-    queryKey: qk.suppressions,
-    queryFn: () => api.listSuppressions(),
-    staleTime: 60_000,
-  });
-}
 
 export function useAddSuppression() {
   const qc = useQueryClient();

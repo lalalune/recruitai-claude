@@ -11,7 +11,7 @@
  * CAPTCHA is surfaced for them to resolve rather than worked around.
  */
 
-import { ipcMain } from 'electron';
+import { handle } from './guard.js';
 import * as linkedin from '../linkedin/index.js';
 import type { LinkedInStatus } from '../../shared/ipc.js';
 
@@ -37,17 +37,19 @@ function toStatus(s: Awaited<ReturnType<typeof linkedin.getStatus>>): LinkedInSt
 }
 
 export function registerLinkedInIpc(): void {
-  ipcMain.handle('getLinkedInStatus', async () => toStatus(await linkedin.getStatus()));
+  handle('getLinkedInStatus', async () => toStatus(await linkedin.getStatus()));
 
-  ipcMain.handle('connectLinkedIn', async () => {
+  handle('connectLinkedIn', async () => {
     // Resolves once the operator has actually completed login in the window, or
     // once they close it. Either way the caller gets the real resulting status
-    // rather than an optimistic guess.
-    await linkedin.openLoginWindow();
-    return toStatus(await linkedin.getStatus());
+    // rather than an optimistic guess — with the login flow's own explanation
+    // (e.g. "the day-stop stays until tomorrow") surfaced instead of dropped.
+    const login = await linkedin.openLoginWindow();
+    const status = toStatus(await linkedin.getStatus());
+    return login.message ? { ...status, message: login.message } : status;
   });
 
-  ipcMain.handle('disconnectLinkedIn', async () => {
+  handle('disconnectLinkedIn', async () => {
     await linkedin.logout();
     return toStatus(await linkedin.getStatus());
   });

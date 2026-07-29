@@ -67,7 +67,25 @@ export function closeDb(): void {
 // Migrations — PRAGMA user_version as the version counter.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MIGRATIONS: { version: number; sql: string }[] = [{ version: 1, sql: schemaSql }];
+const MIGRATIONS: { version: number; sql: string }[] = [
+  { version: 1, sql: schemaSql },
+  {
+    // Follow-ups. The old draft_contact index counted sent/failed rows, so a
+    // second draft for a contact was impossible forever; the constraint's real
+    // intent is one ACTIVE draft per contact. follow_up_of links a bump draft
+    // to the send it threads onto (gmail thread id + Message-ID live there).
+    version: 2,
+    sql: `
+      DROP INDEX draft_contact;
+      CREATE UNIQUE INDEX draft_contact ON draft(contact_id) WHERE state IN ('draft','queued','sending');
+      ALTER TABLE draft ADD COLUMN follow_up_of TEXT REFERENCES send(id);
+      CREATE INDEX draft_follow_up ON draft(follow_up_of) WHERE follow_up_of IS NOT NULL;
+      -- Consecutive refresh 404s. One is an outage; three in a row is a dead
+      -- board, whose reqs then close via the normal differ.
+      ALTER TABLE company ADD COLUMN ats_miss_count INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+];
 
 function migrate(db: Db): void {
   const row = db.prepare('PRAGMA user_version').get() as { user_version: number };
@@ -131,8 +149,12 @@ export function get<T>(db: Db, sql: string, ...params: unknown[]): T | undefined
   return db.prepare(sql).get(...(params as never[])) as T | undefined;
 }
 
-export function run(db: Db, sql: string, ...params: unknown[]): void {
-  db.prepare(sql).run(...(params as never[]));
+export function run(
+  db: Db,
+  sql: string,
+  ...params: unknown[]
+): { changes: number | bigint; lastInsertRowid: number | bigint } {
+  return db.prepare(sql).run(...(params as never[]));
 }
 
 /** Prepared-statement cache — node:sqlite has no built-in one. */

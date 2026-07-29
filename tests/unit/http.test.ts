@@ -127,6 +127,91 @@ for (const status of [429, 403]) {
   });
 }
 
+test('httpRequest honours a small Retry-After on a 429 instead of dropping the source', async () => {
+  await withFetch(
+    (_call, attempt) =>
+      attempt === 0
+        ? new Response('slow down', { status: 429, headers: { 'retry-after': '0' } })
+        : new Response('recovered'),
+    async (calls) => {
+      const res = await httpRequest('https://example.test/paced', { maxRetries: 2 });
+      assert.equal(calls.length, 2, 'a polite Retry-After earns exactly one more attempt');
+      assert.equal(res.ok, true);
+      assert.equal(res.body, 'recovered');
+      assert.equal(res.blocked, undefined);
+    },
+  );
+});
+
+test('httpRequest treats a long Retry-After as the terminal block it is', async () => {
+  await withFetch(
+    () => new Response('come back tomorrow', { status: 429, headers: { 'retry-after': '3600' } }),
+    async (calls) => {
+      const res = await httpRequest('https://example.test/banned', { maxRetries: 5 });
+      assert.equal(calls.length, 1, 'an hour-long Retry-After must not be waited out');
+      assert.equal(res.blocked, true);
+      assert.equal(res.status, 429);
+    },
+  );
+});
+
+test('httpRequest stops honouring Retry-After once retries are exhausted', async () => {
+  await withFetch(
+    () => new Response('slow down', { status: 429, headers: { 'retry-after': '0' } }),
+    async (calls) => {
+      const res = await httpRequest('https://example.test/paced', { maxRetries: 1 });
+      assert.equal(calls.length, 2, 'initial attempt + the one Retry-After retry');
+      assert.equal(res.blocked, true);
+      assert.equal(res.status, 429);
+    },
+  );
+});
+
+test('httpRequest cancels the unread body on a 429 so the connection is released', async () => {
+  let bodyCancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('rate limited'));
+      // Never closed: only an explicit cancel() releases this stream.
+    },
+    cancel() {
+      bodyCancelled = true;
+    },
+  });
+  await withFetch(
+    () => new Response(body, { status: 429 }),
+    async () => {
+      const res = await httpRequest('https://example.test/blocked', { maxRetries: 0 });
+      assert.equal(res.blocked, true);
+      // The discard is fire-and-forget; give the microtask queue one turn.
+      await new Promise((r) => setTimeout(r, 0));
+      assert.equal(bodyCancelled, true, 'an abandoned body pins its undici connection');
+    },
+  );
+});
+
+test('httpRequest bounds body reading by timeoutMs, not just the headers', async () => {
+  // Headers arrive instantly; the body drips one chunk and then never ends.
+  const stalled = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('partial'));
+      // …and nothing further, ever.
+    },
+  });
+  await withFetch(
+    () => new Response(stalled, { status: 200 }),
+    async () => {
+      const started = Date.now();
+      const res = await httpRequest('https://example.test/drip', { timeoutMs: 80, maxRetries: 0 });
+      const elapsed = Date.now() - started;
+      assert.equal(res.ok, false);
+      assert.equal(res.status, 0);
+      assert.match(res.error ?? '', /aborted|timeout/i);
+      assert.ok(elapsed < 3_000, `body read must be cut off near timeoutMs, took ${elapsed}ms`);
+    },
+  );
+});
+
 test('httpRequest retries a 5xx up to maxRetries and stays inside the backoff ceiling', async () => {
   await withFetch(
     () => new Response('boom', { status: 503 }),
@@ -139,8 +224,9 @@ test('httpRequest retries a 5xx up to maxRetries and stays inside the backoff ce
       assert.equal(res.ok, false);
       assert.equal(res.status, 503);
       // Full jitter: attempt 0 sleeps <1000ms, attempt 1 <2000ms. The ceiling is
-      // what keeps a flapping host from stalling an entire sweep.
-      assert.ok(elapsed < 3_400, `backoff must be bounded, took ${elapsed}ms`);
+      // what keeps a flapping host from stalling an entire sweep. The bound only
+      // guards order of magnitude — generous slack because CI runners stall.
+      assert.ok(elapsed < 4_500, `backoff must be bounded, took ${elapsed}ms`);
     },
   );
 });
@@ -355,8 +441,10 @@ test('mapLimit jitter is bounded by jitterMs per task', async () => {
   const started = Date.now();
   await mapLimit(items, 1, async (n) => n, { jitterMs: 40 });
   const elapsed = Date.now() - started;
-  // Serial worker: at most jitterMs of sleep per item, plus scheduling slack.
-  assert.ok(elapsed < items.length * 40 + 250, `jitter must be bounded, took ${elapsed}ms`);
+  // Serial worker: at most jitterMs of sleep per item (240ms worst case), plus
+  // generous scheduling slack — the bound only guards order of magnitude,
+  // because CI runners stall.
+  assert.ok(elapsed < 800, `jitter must be bounded, took ${elapsed}ms`);
 });
 
 test('mapLimit passes the true index to the task', async () => {

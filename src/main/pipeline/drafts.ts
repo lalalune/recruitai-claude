@@ -14,10 +14,12 @@
 
 import { all, get, run, tx, ulid, type Db } from '../db/index.js';
 import { httpRequest } from '../util/http.js';
-import { getSending, getSpendCapUsd, readSecret, SECRET_ANTHROPIC } from '../settings.js';
+import { getSending, getSpendCapUsd, getTemplates, readSecret, SECRET_ANTHROPIC } from '../settings.js';
+import { assembleEmail, renderTemplate, type TemplateVars } from '../../shared/outreach.js';
 import { reserveApiCall, commitApiCall, releaseApiCall, SpendCapExceeded } from './tasks.js';
 import { daysOpen, estimateReqFee, isEngineering } from '../../shared/score.js';
 import { toReqDomain } from './scoring.js';
+import { COMPANY_SUPPRESSION_MATCH } from './suppression.js';
 import type { RunCtx, SourceOutcome } from './run.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,8 +62,6 @@ export function bandFor(headcount: number | null): HeadcountBand {
 // ─────────────────────────────────────────────────────────────────────────────
 // Deterministic templates
 // ─────────────────────────────────────────────────────────────────────────────
-
-const OPT_OUT_LINE = "If this isn't relevant, reply with 'no thanks' and I'll close the file — you won't hear from me again.";
 
 function usd(n: number): string {
   return n >= 1000 ? `$${Math.round(n / 1000)}k` : `$${n}`;
@@ -183,11 +183,153 @@ export function renderBody(facts: DraftFacts): string {
   return lines.join('\n');
 }
 
-function assembleEmail(body: string, signature: string, includeOptOut: boolean): string {
-  const parts = [body.trimEnd()];
-  if (includeOptOut) parts.push('', OPT_OUT_LINE);
-  if (signature.trim()) parts.push('', signature.trim());
-  return parts.join('\n');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Follow-ups
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Give a first send at least this long before bumping the thread. */
+export const FOLLOW_UP_MIN_AGE_MS = 2 * 86_400_000;
+
+/**
+ * A short, deterministic bump for a sent-and-silent message. Threads onto the
+ * original send at send time (sendOne reads follow_up_of → thread id and
+ * Message-ID). Deliberately not LLM-rewritten: a two-sentence bump has no
+ * facts to embellish, and embellishment is the only thing a model would add.
+ */
+export async function followUpDraftFor(db: Db, sendId: string): Promise<GeneratedDraft> {
+  const send = get<{
+    id: string;
+    company_id: string;
+    contact_id: string;
+    subject: string;
+    sent_at: number | null;
+    outcome: string;
+    contact_status: string;
+    first_name: string | null;
+    full_name: string;
+    company_name: string;
+  }>(
+    db,
+    `SELECT s.id, s.company_id, s.contact_id, s.subject, s.sent_at, s.outcome,
+            c.status AS contact_status, c.first_name, c.full_name, co.name AS company_name
+       FROM send s
+       JOIN contact c ON c.id = s.contact_id
+       JOIN company co ON co.id = s.company_id
+      WHERE s.id = ?`,
+    sendId,
+  );
+  if (!send) throw new DraftNotPossible('Unknown send.');
+  if (send.outcome === 'replied') {
+    throw new DraftNotPossible('They replied — answer the thread, don’t bump it.');
+  }
+  if (send.outcome === 'bounced') {
+    throw new DraftNotPossible('The address bounced; a follow-up cannot arrive.');
+  }
+  if (send.outcome !== 'sent' && send.outcome !== 'silent') {
+    throw new DraftNotPossible('Only a delivered message can be followed up.');
+  }
+  if (send.contact_status === 'rejected' || send.contact_status === 'bounced') {
+    throw new DraftNotPossible('This contact is closed.');
+  }
+  // The person, not just this thread: a reply marked on any of their sends
+  // means they answered — bumping a parallel thread reads as ignoring them.
+  if (send.contact_status === 'replied') {
+    throw new DraftNotPossible('They already replied — answer that thread instead of bumping this one.');
+  }
+  if (send.sent_at != null && Date.now() - send.sent_at < FOLLOW_UP_MIN_AGE_MS) {
+    throw new DraftNotPossible('Sent less than two days ago — give them room to answer first.');
+  }
+
+  // Two bumps per person is the ceiling. A third unanswered email is not
+  // persistence, it is the thing suppression lists exist for.
+  const bumps = get<{ n: number }>(
+    db,
+    `SELECT count(*) AS n FROM send s2 JOIN draft d2 ON d2.id = s2.draft_id
+      WHERE s2.contact_id = ? AND d2.follow_up_of IS NOT NULL
+        AND s2.outcome IN ('sent','silent','replied','bounced')`,
+    send.contact_id,
+  );
+  if ((bumps?.n ?? 0) >= 2) {
+    throw new DraftNotPossible('Two follow-ups have already gone out — time to move on.');
+  }
+
+  const active = get<{ id: string }>(
+    db,
+    `SELECT id FROM draft WHERE contact_id = ? AND state IN ('draft','queued','sending')`,
+    send.contact_id,
+  );
+  if (active) throw new DraftNotPossible('An active draft for this person already exists.');
+
+  // A FAILED follow-up still owns the intent: requeueing it later would
+  // collide with a second one on the active-draft index.
+  const failedBump = get<{ id: string }>(
+    db,
+    `SELECT id FROM draft WHERE contact_id = ? AND state = 'failed' AND follow_up_of IS NOT NULL`,
+    send.contact_id,
+  );
+  if (failedBump) {
+    throw new DraftNotPossible('A failed follow-up already exists — requeue or skip it first.');
+  }
+
+  // Honesty rule: no open req, no claim to make, no bump.
+  const now = new Date();
+  const headline = pickHeadlineReq(db, send.company_id, now);
+  if (!headline) {
+    throw new DraftNotPossible('The roles this thread was about have closed — nothing truthful left to bump.');
+  }
+
+  const sending = getSending();
+  const first = firstNameOf(send.first_name, send.full_name);
+  const days = daysOpen(headline, now);
+
+  const lines = [
+    `Hi ${first},`,
+    '',
+    `Floating this back up — your ${headline.title} search still shows open${days > 0 ? ` (${days} days now)` : ''}. ` +
+      `Happy to send over two or three profiles whenever it would be useful.`,
+  ];
+
+  const subject = /^re:/i.test(send.subject) ? send.subject : `Re: ${send.subject}`;
+  const body = assembleEmail(lines.join('\n'), {
+    signature: sending.signature,
+    includeOptOutLine: sending.includeOptOutLine,
+    postalAddress: sending.postalAddress,
+  });
+
+  const id = ulid();
+  try {
+    run(
+      db,
+      `INSERT INTO draft (id, company_id, contact_id, subject, body, req_ids, template, generated_by, follow_up_of, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'follow_up', 'followup:deterministic', ?, ?, ?)`,
+      id,
+      send.company_id,
+      send.contact_id,
+      subject,
+      body,
+      JSON.stringify([Number(headline.id)]),
+      sendId,
+      Date.now(),
+      Date.now(),
+    );
+  } catch (err) {
+    if (err instanceof Error && /UNIQUE constraint failed: draft\.contact_id/.test(err.message)) {
+      throw new DraftNotPossible('A draft for this person was just created elsewhere.');
+    }
+    throw err;
+  }
+
+  return {
+    id,
+    companyId: send.company_id,
+    contactId: send.contact_id,
+    subject,
+    body,
+    reqIds: [Number(headline.id)],
+    template: 'follow_up',
+    generatedBy: 'followup:deterministic',
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,19 +423,29 @@ export async function rewriteBodyProse(
     },
     body: JSON.stringify(payload),
     timeoutMs: 90_000,
-    maxRetries: 1,
+    // Paid calls never auto-retry: a retried request that already completed
+    // server-side bills twice (same invariant as the verifier's PAID_HTTP).
+    maxRetries: 0,
   });
 
   if (!res.ok || !res.body) {
-    commitApiCall(db, reservation, {
-      ok: false,
-      httpStatus: res.status,
-      actualCostMicros: 0,
-      error: res.error ?? `HTTP ${res.status}`,
-    });
-    // A transport failure never happened as far as billing is concerned, so free
-    // the key rather than permanently blocking a retry for this draft.
-    if (res.status === 0) releaseApiCall(db, reservation, 'transport failure');
+    // A refused call (429/5xx/connection failure) consumed no credit — release
+    // the reservation so a later pass can retry. A client-side TIMEOUT is the
+    // one failure that MAY have completed and billed server-side, so it commits
+    // a failed row instead: one at-risk credit, never an unbounded ledger-
+    // invisible retry loop. (The old code committed first and then tried to
+    // release, which never matched — every blip locked the draft forever.)
+    const maybeBilled = res.status === 0 && /abort|timeout/i.test(res.error ?? '');
+    if (maybeBilled) {
+      commitApiCall(db, reservation, {
+        ok: false,
+        httpStatus: 0,
+        actualCostMicros: 0,
+        error: `timeout — response unknown, possibly billed: ${res.error ?? ''}`,
+      });
+    } else {
+      releaseApiCall(db, reservation, res.error ?? `HTTP ${res.status}`);
+    }
     return { body: null, note: `anthropic HTTP ${res.status}` };
   }
 
@@ -383,7 +535,7 @@ function loadTarget(db: Db, companyId: string, contactId?: string): DraftTarget 
           SELECT 1 FROM suppression s
            WHERE (s.kind = 'email'   AND lower(s.value) = lower(c.email))
               OR (s.kind = 'domain'  AND lower(s.value) = lower(substr(c.email, instr(c.email, '@') + 1)))
-              OR (s.kind = 'company' AND (s.value = co.id OR (co.domain IS NOT NULL AND lower(s.value) = lower(co.domain))))
+              OR (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH})
         )
       ORDER BY c.is_primary DESC, c.contact_score DESC, c.created_at
       LIMIT 1`,
@@ -446,17 +598,53 @@ export async function generateDraftFor(
   const headline = pickHeadlineReq(db, target.companyId, now);
   if (!headline) throw new DraftNotPossible('No open requisition to write about.');
 
-  const existing = get<{ id: string; edited: number; state: string }>(
+  // One ACTIVE draft per contact (unique index). A sent row no longer blocks
+  // the slot — follow-ups are new rows — so the lookup is tiered: an active
+  // row is replaced in place, a failed one is reused, a sent one only guards.
+  const active = get<{ id: string; edited: number; state: string; follow_up_of: string | null }>(
     db,
-    `SELECT id, edited, state FROM draft WHERE contact_id = ? AND state != 'skipped'`,
+    `SELECT id, edited, state, follow_up_of FROM draft WHERE contact_id = ? AND state IN ('draft','queued','sending')`,
     target.contactId,
   );
-  if (existing && existing.edited === 1 && !opts.force) {
+  // Mid-send is untouchable, force included: the claimed Gmail call is in
+  // flight and its success path stamps whatever row content 'sent'.
+  if (active && active.state === 'sending') {
+    throw new DraftNotPossible('This draft is being sent right now.');
+  }
+  // A follow-up is never regenerated into a cold pitch — force included. The
+  // replacement would keep (or worse, silently carry) the threading intent
+  // while the copy stops being a reply. Skip it first if a fresh cold email
+  // is genuinely wanted.
+  if (active && active.follow_up_of) {
+    throw new DraftNotPossible('An active follow-up exists for this person — edit it, or skip it first.');
+  }
+  if (active && active.edited === 1 && !opts.force) {
     throw new DraftNotPossible('This draft has operator edits; regenerate explicitly to replace it.');
   }
-  if (existing && existing.state !== 'draft' && !opts.force) {
-    throw new DraftNotPossible(`Draft is already ${existing.state}.`);
+  if (active && active.state !== 'draft' && !opts.force) {
+    throw new DraftNotPossible(`Draft is already ${active.state}.`);
   }
+
+  const failed = active
+    ? null
+    : get<{ id: string; edited: number; state: string }>(
+        db,
+        `SELECT id, edited, state FROM draft WHERE contact_id = ? AND state = 'failed' ORDER BY updated_at DESC LIMIT 1`,
+        target.contactId,
+      );
+
+  if (!active && !failed && !opts.force) {
+    const sent = get<{ id: string }>(
+      db,
+      `SELECT id FROM draft WHERE contact_id = ? AND state = 'sent' LIMIT 1`,
+      target.contactId,
+    );
+    if (sent) {
+      throw new DraftNotPossible('Already sent to this person — use Follow up on the Sent tab instead.');
+    }
+  }
+
+  const existing = active ?? failed;
 
   const sending = getSending();
   const facts: DraftFacts = {
@@ -483,29 +671,92 @@ export async function generateDraftFor(
     ycBatch: target.ycBatch,
   };
 
-  const subject = renderSubject(facts);
-  const deterministic = renderBody(facts);
+  // Operator template overrides (Settings → Templates) take precedence over
+  // the built-in renderers. Variables come from the same DraftFacts; a line
+  // whose variable has no value is dropped, exactly like the built-ins.
+  const override = getTemplates()[facts.band];
+  const vars: TemplateVars = {
+    firstName: facts.contactFirstName,
+    companyName: facts.companyName,
+    reqTitle: facts.reqTitle,
+    reqDaysOpen: facts.reqDaysOpen,
+    reqLocation: facts.reqLocation,
+    openReqCount: facts.openReqCount,
+    openEngCount: facts.openEngCount,
+    staleReqCount: facts.staleReqCount,
+    fee: facts.estimatedFeeUsd != null ? usd(facts.estimatedFeeUsd) : null,
+    fundingStage: facts.fundingStage,
+    ycBatch: facts.ycBatch,
+  };
+  const customSubject = override.subject.trim() ? renderTemplate(override.subject, vars) : '';
+  const customBody = override.body.trim() ? renderTemplate(override.body, vars) : '';
+
+  const subject = customSubject || renderSubject(facts);
+  const deterministic = customBody || renderBody(facts);
 
   let prose = deterministic;
-  let generatedBy = `template:${facts.band}`;
+  let generatedBy = customBody ? `custom:${facts.band}` : `template:${facts.band}`;
   if (opts.useLlm !== false) {
-    const rewrite = await rewriteBodyProse(db, facts, deterministic, `draft:${target.contactId}:${headline.id}`);
+    // Force is a deliberate re-purchase: without a fresh key, every forced
+    // regenerate silently fell back to the deterministic body forever
+    // ("already generated" ledger hit) — the paid prose was unreachable.
+    // Max-suffix, not count: this ledger DELETES released reservations, so a
+    // count-based suffix could recompute an existing key after a refusal and
+    // wedge every future force into the ledger-hit path.
+    const baseKey = `draft:${target.contactId}:${headline.id}`;
+    let rewriteKey = baseKey;
+    if (opts.force) {
+      const keys = all<{ idempotency_key: string }>(
+        db,
+        `SELECT idempotency_key FROM api_call WHERE provider = 'anthropic' AND (idempotency_key = ? OR idempotency_key LIKE ?)`,
+        baseKey,
+        `${baseKey}#%`,
+      );
+      if (keys.length > 0) {
+        const maxSuffix = Math.max(
+          1,
+          ...keys.map((k) => {
+            const m = /#(\d+)$/.exec(k.idempotency_key);
+            return m ? Number(m[1]) : 1;
+          }),
+        );
+        rewriteKey = `${baseKey}#${maxSuffix + 1}`;
+      }
+    }
+    const rewrite = await rewriteBodyProse(db, facts, deterministic, rewriteKey);
     if (rewrite.body) {
       prose = rewrite.body;
-      generatedBy = `template:${facts.band}+${ANTHROPIC_MODEL}`;
+      generatedBy = `${generatedBy}+${ANTHROPIC_MODEL}`;
     }
   }
 
-  const body = assembleEmail(prose, sending.signature, sending.includeOptOutLine);
+  const body = assembleEmail(prose, {
+    signature: sending.signature,
+    includeOptOutLine: sending.includeOptOutLine,
+    postalAddress: sending.postalAddress,
+  });
   const reqIds = [Number(headline.id)];
   const id = existing?.id ?? ulid();
 
+  try {
+    writeDraftRow();
+  } catch (err) {
+    // Concurrent generation (drainer task + operator click) both passing the
+    // active-check resolves here via the unique index — surface it as the
+    // ordinary "someone got there first", not a raw SQLITE_CONSTRAINT.
+    if (err instanceof Error && /UNIQUE constraint failed: draft\.contact_id/.test(err.message)) {
+      throw new DraftNotPossible('A draft for this person was just created elsewhere — refresh and edit that one.');
+    }
+    throw err;
+  }
+
+  function writeDraftRow(): void {
   tx(db, () => {
     if (existing) {
       run(
         db,
         `UPDATE draft SET subject = ?, body = ?, req_ids = ?, template = ?, generated_by = ?, edited = 0,
-                          state = 'draft', updated_at = ? WHERE id = ?`,
+                          state = 'draft', follow_up_of = NULL, scheduled_at = NULL, updated_at = ? WHERE id = ?`,
         subject,
         body,
         JSON.stringify(reqIds),
@@ -532,6 +783,7 @@ export async function generateDraftFor(
       );
     }
   });
+  }
 
   return {
     id,

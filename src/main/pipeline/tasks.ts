@@ -122,6 +122,16 @@ export function fail(db: Db, id: number, error: unknown): 'retry' | 'dead' {
   return 'retry';
 }
 
+/**
+ * Dead-letter a task unconditionally, bypassing the retry ladder. For defects
+ * (unknown kind, unparseable payload) where retrying can only repeat the
+ * failure and delay the burial `fail()` would eventually reach.
+ */
+export function bury(db: Db, id: number, error: unknown): void {
+  const message = truncate(error instanceof Error ? error.message : String(error), 2000);
+  run(db, `UPDATE task SET state = 'dead', last_error = ?, finished_at = ? WHERE id = ?`, message, Date.now(), id);
+}
+
 export function backoffMs(attempts: number): number {
   const base = Math.min(60_000 * 2 ** Math.max(0, attempts - 1), 3_600_000);
   return Math.floor(base / 2 + Math.random() * (base / 2));

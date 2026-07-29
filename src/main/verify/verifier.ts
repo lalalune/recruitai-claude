@@ -341,21 +341,59 @@ function commitApiCall(
 
 /**
  * The operator asking to re-verify is a deliberate purchase, so it gets its own
- * ledger key. Automatic paths never pass `force` and therefore always collide
- * with the base key, which is the whole protection.
+ * ledger key. Automatic paths collide with the base key inside a freshness
+ * window, which is the double-charge protection — but once the latest
+ * SUCCEEDED verification is older than the freshness window, the policy that
+ * queued the address for re-verification also authorises paying for it, so a
+ * fresh key is allocated. Without this, re-verification after staleness
+ * collided forever and fabricated 'unknown' verdicts over valid ones.
  */
-function idempotencyKeyFor(db: Db, provider: string, email: string, force: boolean): string {
-  if (!force) return email;
-  const n =
-    get<{ n: number }>(
-      db,
-      `SELECT count(*) AS n FROM api_call WHERE provider = ? AND (idempotency_key = ? OR idempotency_key LIKE ?)`,
-      provider,
-      email,
-      `${email}#%`,
-    )?.n ?? 0;
-  return `${email}#${n + 1}`;
+/** `_` and `%` are LIKE wildcards and `_` is common in real addresses — escape,
+ *  or john_smith's ledger reads john.smith's history. */
+function likePrefix(email: string): string {
+  return `${email.replace(/([%_\\])/g, '\\$1')}#%`;
 }
+
+function idempotencyKeyFor(db: Db, provider: string, email: string, force: boolean, freshnessMs: number): string {
+  const nextKey = () => {
+    const n =
+      get<{ n: number }>(
+        db,
+        `SELECT count(*) AS n FROM api_call WHERE provider = ? AND (idempotency_key = ? OR idempotency_key LIKE ? ESCAPE '\\')`,
+        provider,
+        email,
+        likePrefix(email),
+      )?.n ?? 0;
+    return `${email}#${n + 1}`;
+  };
+
+  if (force) return nextKey();
+
+  const latest = get<{ idempotency_key: string; state: string; finished_at: number | null }>(
+    db,
+    `SELECT idempotency_key, state, finished_at FROM api_call
+      WHERE provider = ? AND (idempotency_key = ? OR idempotency_key LIKE ? ESCAPE '\\')
+      ORDER BY id DESC LIMIT 1`,
+    provider,
+    email,
+    likePrefix(email),
+  );
+  if (!latest) return email;
+
+  // A failed or stuck-reserved latest attempt must be retried under ITS OWN
+  // key: reserveApiCall's reuse/stale-reservation logic targets that row.
+  // Falling back to the base key here collided with the old SUCCEEDED base
+  // row and fabricated 'unknown' forever after one failed re-verification.
+  if (latest.state !== 'succeeded') return latest.idempotency_key;
+
+  const stale = latest.finished_at != null && Date.now() - latest.finished_at > freshnessMs;
+  // Fresh success → collide with THAT row (normally unreachable: fresh
+  // evidence cache-hits before keying), never with an older base row.
+  return stale ? nextKey() : latest.idempotency_key;
+}
+
+/** Exposed for tests: key-allocation is where double-charge protection lives. */
+export const __idempotencyKeyForTests = idempotencyKeyFor;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Evidence + cache
@@ -1083,7 +1121,13 @@ export async function verifyEmails(
   const reservations = new Map<string, Reservation>();
   const toCall: string[] = [];
   for (const email of needsPaid) {
-    const key = idempotencyKeyFor(db, config.provider, canonicalizeForCache(email), opts.force === true);
+    const key = idempotencyKeyFor(
+      db,
+      config.provider,
+      canonicalizeForCache(email),
+      opts.force === true,
+      config.freshnessDays * 86_400_000,
+    );
     const reservation = reserveApiCall(db, {
       provider: config.provider,
       endpoint: adapter.batchSize > 1 && needsPaid.length > 1 ? 'verify/batch' : 'verify',

@@ -375,6 +375,22 @@ export function writeObservation(
   evidenceId: number | null,
   confidence: Confidence,
 ): number {
+  // A source repeating its own latest value adds no information — and the
+  // daily board refresh would otherwise append identical (platform, token,
+  // careersUrl) rows forever, with the resolver re-reading the whole history
+  // on each one. Same-value re-observations return the existing row.
+  const latest = get<{ id: number; value: string | null; confidence: Confidence }>(
+    db,
+    `SELECT id, value, confidence FROM field_observation
+      WHERE entity = ? AND entity_id = ? AND field = ? AND source = ?
+      ORDER BY observed_at DESC, id DESC LIMIT 1`,
+    entity,
+    entityId,
+    field,
+    source,
+  );
+  if (latest && latest.value === value && latest.confidence === confidence) return latest.id;
+
   const row = get<{ id: number }>(
     db,
     `INSERT INTO field_observation (entity, entity_id, field, value, source, evidence_id, confidence, observed_at)
@@ -490,7 +506,7 @@ export interface ReqSyncResult {
   reposted: number;
 }
 
-export function estimateFeeMicrosFree(compMin: number | null, compMax: number | null): number | null {
+export function estimateFeeUsdFree(compMin: number | null, compMax: number | null): number | null {
   if (compMin == null && compMax == null) return null;
   const mid = compMin != null && compMax != null ? (compMin + compMax) / 2 : (compMin ?? compMax)!;
   if (!Number.isFinite(mid) || mid < 20_000 || mid > 2_000_000) return null;
@@ -534,7 +550,7 @@ export function upsertReqs(
     seen.add(externalId);
 
     const description = job.descriptionText ?? null;
-    const fee = estimateFeeMicrosFree(job.compMin ?? null, job.compMax ?? null);
+    const fee = estimateFeeUsdFree(job.compMin ?? null, job.compMax ?? null);
     const published = toEpochMs(job.publishedAt) ?? toEpochMs(job.updatedAt);
     const namedContact = extractNamedContact(description, companyDomain);
     const prior = byExternal.get(externalId);
@@ -821,6 +837,12 @@ function isBlockSignal(err: unknown): boolean {
  *  the transaction overhead stays negligible. */
 const SWEEP_FLUSH_EVERY = 25;
 
+/** A company whose board we already know how to reach — refresh, don't probe. */
+interface RefreshTarget extends SweepTarget {
+  ats_platform: string;
+  ats_token: string;
+}
+
 export async function ingestAtsSweep(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
   const crawl = getCrawl();
   const targets = all<SweepTarget>(
@@ -830,10 +852,18 @@ export async function ingestAtsSweep(db: Db, ctx: RunCtx): Promise<SourceOutcome
       ORDER BY (headcount IS NULL), quality_score DESC, created_at`,
   );
 
-  if (targets.length === 0) return { records: 0, message: 'Every company already has a resolved ATS board' };
+  // Snapshot the refresh set BEFORE probing: a board resolved by this very run
+  // was fetched moments ago and re-fetching it now would say nothing new.
+  const refreshTargets = all<RefreshTarget>(
+    db,
+    `SELECT id, name, website, domain, ats_platform, ats_token FROM company
+      WHERE ats_platform IS NOT NULL AND ats_token IS NOT NULL AND canonical_id IS NULL
+      ORDER BY (headcount IS NULL), quality_score DESC, created_at`,
+  );
 
-  ctx.log('info', `Probing ${targets.length} companies against ${Object.keys(ATS_FETCHERS).length} ATS platforms…`);
-  ctx.progress(0, targets.length);
+  if (targets.length === 0 && refreshTargets.length === 0) {
+    return { records: 0, message: 'No companies to probe and no known boards to refresh' };
+  }
 
   // Per-platform, not global: one host rate-limiting us must not throw away the
   // whole sweep. probeAts adds to this set and skips those platforms thereafter.
@@ -842,6 +872,8 @@ export async function ingestAtsSweep(db: Db, ctx: RunCtx): Promise<SourceOutcome
   const pending: SweepHit[] = [];
   let resolved = 0;
   let totalJobs = 0;
+  let closed = 0;
+  let reposted = 0;
 
   // Persist as we go rather than buffering the whole sweep. A 5,000-company run
   // takes tens of minutes against live hosts; writing only at the end would
@@ -853,7 +885,11 @@ export async function ingestAtsSweep(db: Db, ctx: RunCtx): Promise<SourceOutcome
     const jobs = batch.reduce((n, h) => n + h.board.jobs.length, 0);
     const write = () =>
       tx(db, () => {
-        for (const hit of batch) persistBoard(db, hit.target, hit.board);
+        for (const hit of batch) {
+          const sync = persistBoard(db, hit.target, hit.board);
+          closed += sync.closed;
+          reposted += sync.reposted;
+        }
       });
     // FTS triggers dominate large inserts; drop and rebuild past a couple thousand.
     if (jobs > 2000) bulkLoadReqs(db, write);
@@ -862,55 +898,134 @@ export async function ingestAtsSweep(db: Db, ctx: RunCtx): Promise<SourceOutcome
     totalJobs += jobs;
   };
 
-  await mapLimit(
-    targets,
-    crawl.concurrency,
-    async (target) => {
-      if (allBlocked || ctx.cancelled()) return null;
-      for (const token of candidateTokens(target.name, target.website)) {
+  if (targets.length > 0) {
+    ctx.log('info', `Probing ${targets.length} companies against ${Object.keys(ATS_FETCHERS).length} ATS platforms…`);
+    ctx.progress(0, targets.length);
+
+    await mapLimit(
+      targets,
+      crawl.concurrency,
+      async (target) => {
         if (allBlocked || ctx.cancelled()) return null;
-        try {
-          const board = await probeAts(token, blockedPlatforms);
-          if (board) {
-            pending.push({ target, board });
-            if (pending.length >= SWEEP_FLUSH_EVERY) flush();
-            return null;
-          }
-        } catch (err) {
-          // Only raised once EVERY platform has blocked us; then there is
-          // nothing left to ask and we stand down.
-          if (err instanceof AllPlatformsBlockedError || isBlockSignal(err)) {
-            allBlocked = true;
-            return null;
+        for (const token of candidateTokens(target.name, target.website)) {
+          if (allBlocked || ctx.cancelled()) return null;
+          try {
+            const board = await probeAts(token, blockedPlatforms, { name: target.name, domain: target.domain });
+            if (board) {
+              pending.push({ target, board });
+              if (pending.length >= SWEEP_FLUSH_EVERY) flush();
+              return null;
+            }
+          } catch (err) {
+            // Only raised once EVERY platform has blocked us; then there is
+            // nothing left to ask and we stand down.
+            if (err instanceof AllPlatformsBlockedError || isBlockSignal(err)) {
+              allBlocked = true;
+              return null;
+            }
           }
         }
-      }
-      return null;
-    },
-    { jitterMs: 150, onProgress: (done, total) => ctx.progress(done, total) },
-  );
-
-  if (blockedPlatforms.size > 0) {
-    ctx.log(
-      'warn',
-      `Rate-limited by ${[...blockedPlatforms].join(', ')} — those platforms were skipped for the rest of this run. Re-run later to pick them up.`,
+        return null;
+      },
+      { jitterMs: 150, onProgress: (done, total) => ctx.progress(done, total) },
     );
+
+    flush();
   }
 
-  flush();
+  const discovered = resolved;
+  ctx.log('info', `${discovered} boards resolved, ${totalJobs} open roles ingested.`);
+  if (allBlocked) {
+    logBlockedPlatforms(ctx, blockedPlatforms);
+    // The counts ride in the message: the flush above already persisted this
+    // work, and a bare "blocked" in lastResult would hide that it landed.
+    throw new BlockedError(`ats-sweep (persisted ${discovered} boards, ${totalJobs} roles before standing down)`, 429);
+  }
 
-  ctx.log('info', `${resolved} boards resolved, ${totalJobs} open roles ingested.`);
-  if (allBlocked) throw new BlockedError('ats-sweep', 429);
-  return { records: resolved, message: `${resolved} ATS boards, ${totalJobs} roles` };
+  // Refresh pass: re-fetch every board we already know the address of, so the
+  // req differ can see closes, reposts and staling. Without this, a company is
+  // fetched exactly once in its life and open_req_count fossilises — the
+  // close/repost machinery in upsertReqs never gets a second look.
+  if (refreshTargets.length > 0 && !ctx.cancelled()) {
+    ctx.log('info', `Refreshing ${refreshTargets.length} known boards for closes and reposts…`);
+    ctx.progress(0, refreshTargets.length);
+
+    await mapLimit(
+      refreshTargets,
+      crawl.concurrency,
+      async (target) => {
+        if (allBlocked || ctx.cancelled()) return null;
+        const fetcher = ATS_FETCHERS[target.ats_platform as keyof typeof ATS_FETCHERS];
+        // Careers pages record platforms we have no adapter for (workday,
+        // rippling, …) — nothing to re-fetch there.
+        if (!fetcher) return null;
+        const platform = target.ats_platform as AtsPlatform;
+        if (blockedPlatforms.has(platform)) return null;
+        try {
+          const result = await fetcher(target.ats_token);
+          if (result.httpStatus === 429 || result.httpStatus === 403) blockedPlatforms.add(platform);
+          // An empty board is a real observation — every role closed. A failed
+          // fetch is not: only ok results reach the differ, so a 404 or outage
+          // can never mass-close a company's reqs. A PARTIAL board (pagination
+          // broke mid-way) is worse than a failed one here: the differ would
+          // read the missing pages as hundreds of closes, then re-open them as
+          // fake "reposts" — which end up as false claims in outreach copy.
+          if (result.ok && result.data && !result.data.partial) {
+            if (Number(get<{ n: number }>(db, 'SELECT ats_miss_count AS n FROM company WHERE id = ?', target.id)?.n ?? 0) !== 0) {
+              run(db, 'UPDATE company SET ats_miss_count = 0 WHERE id = ?', target.id);
+            }
+            pending.push({ target, board: result.data });
+            if (pending.length >= SWEEP_FLUSH_EVERY) flush();
+          } else if (result.httpStatus === 404) {
+            // One 404 is an outage; three consecutive are a dead board. Then
+            // absence is finally trustworthy: close via the normal differ and
+            // drop the token so the careers-crawl can re-resolve it later.
+            const misses = Number(get<{ n: number }>(db, 'SELECT ats_miss_count AS n FROM company WHERE id = ?', target.id)?.n ?? 0) + 1;
+            if (misses >= 3) {
+              tx(db, () => {
+                upsertReqs(db, target.id, platform, [], null, target.domain);
+                run(db, 'UPDATE company SET ats_token = NULL, ats_miss_count = 0, updated_at = ? WHERE id = ?', Date.now(), target.id);
+              });
+              ctx.log('warn', `Board for ${target.name ?? target.id} gone (3 consecutive 404s) — reqs closed, token cleared.`);
+            } else {
+              run(db, 'UPDATE company SET ats_miss_count = ? WHERE id = ?', misses, target.id);
+            }
+          }
+        } catch (err) {
+          if (isBlockSignal(err)) blockedPlatforms.add(platform);
+        }
+        return null;
+      },
+      { jitterMs: 150, onProgress: (done, total) => ctx.progress(done, total) },
+    );
+
+    flush();
+  }
+
+  const refreshed = resolved - discovered;
+  logBlockedPlatforms(ctx, blockedPlatforms);
+  ctx.log('info', `${refreshed} known boards refreshed (${closed} closed, ${reposted} reposted).`);
+  return {
+    records: resolved,
+    message: `${discovered} ATS boards discovered, ${refreshed} refreshed (${closed} closed, ${reposted} reposted), ${totalJobs} roles`,
+  };
 }
 
-function persistBoard(db: Db, target: SweepTarget, board: AtsBoard): void {
+function logBlockedPlatforms(ctx: RunCtx, blockedPlatforms: Set<AtsPlatform>): void {
+  if (blockedPlatforms.size === 0) return;
+  ctx.log(
+    'warn',
+    `Rate-limited by ${[...blockedPlatforms].join(', ')} — those platforms were skipped for the rest of this run. Re-run later to pick them up.`,
+  );
+}
+
+function persistBoard(db: Db, target: SweepTarget, board: AtsBoard): ReqSyncResult {
   const evidenceId = storeRaw(db, board.platform, boardUrl(board), 200, board.rawBody);
   observeCompany(db, target.id, 'atsPlatform', board.platform, board.platform, evidenceId, 'high');
   observeCompany(db, target.id, 'atsToken', board.token, board.platform, evidenceId, 'high');
   const careers = board.jobs[0]?.url ?? null;
   if (careers) observeCompany(db, target.id, 'careersUrl', careers, board.platform, evidenceId, 'medium');
-  upsertReqs(db, target.id, board.platform, board.jobs, evidenceId, target.domain);
+  return upsertReqs(db, target.id, board.platform, board.jobs, evidenceId, target.domain);
 }
 
 function boardUrl(board: AtsBoard): string {
@@ -955,7 +1070,7 @@ export async function ingestLinkedInUrls(db: Db, ctx: RunCtx): Promise<SourceOut
   ctx.log('info', `Reading ${targets.length} company sites for their LinkedIn page…`);
   ctx.progress(0, targets.length);
 
-  const found: { id: string; url: string; foundAt: string }[] = [];
+  const found: { id: string; url: string; foundAt: string; pageBody: string }[] = [];
   let flushed = 0;
 
   const flush = () => {
@@ -963,7 +1078,9 @@ export async function ingestLinkedInUrls(db: Db, ctx: RunCtx): Promise<SourceOut
     const batch = found.splice(0, found.length);
     tx(db, () => {
       for (const f of batch) {
-        const evidenceId = storeRaw(db, 'careers_page', f.foundAt, 200, f.url);
+        // Evidence is the PAGE we read, not the URL string we derived from it —
+        // "every value traces to bytes we actually received".
+        const evidenceId = storeRaw(db, 'careers_page', f.foundAt, 200, f.pageBody);
         observeCompany(db, f.id, 'linkedinUrl', f.url, 'careers_page', evidenceId, 'high');
       }
     });
@@ -977,7 +1094,7 @@ export async function ingestLinkedInUrls(db: Db, ctx: RunCtx): Promise<SourceOut
       if (ctx.cancelled()) return null;
       const profile = await findCompanyLinkedIn(target.website);
       if (profile) {
-        found.push({ id: target.id, url: profile.linkedinUrl, foundAt: profile.foundAt });
+        found.push({ id: target.id, url: profile.linkedinUrl, foundAt: profile.foundAt, pageBody: profile.pageBody });
         if (found.length >= 25) flush();
       }
       return null;
@@ -994,6 +1111,15 @@ export async function ingestLinkedInUrls(db: Db, ctx: RunCtx): Promise<SourceOut
 // Source: careers-page crawl (recovers boards whose token isn't guessable)
 // ─────────────────────────────────────────────────────────────────────────────
 
+interface CrawlHit {
+  target: SweepTarget;
+  platform: string;
+  token: string;
+  foundAt: string;
+  board: AtsBoard | null;
+  rawBody: string | null;
+}
+
 export async function ingestCareersCrawl(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
   const crawl = getCrawl();
   const targets = all<SweepTarget>(
@@ -1008,39 +1134,78 @@ export async function ingestCareersCrawl(db: Db, ctx: RunCtx): Promise<SourceOut
   ctx.log('info', `Reading ${targets.length} careers pages for embedded ATS links…`);
   ctx.progress(0, targets.length);
 
-  let blocked = false;
+  // Per-platform, exactly like the sweep: the careers pages and each ATS host
+  // are different parties, and one board host rate-limiting us must not end
+  // the crawl for everyone else. A global stop here once threw away a whole
+  // run on a single 429 — see VERIFIED-SOURCES.md.
+  const blockedPlatforms = new Set<AtsPlatform>();
   let resolved = 0;
   let roles = 0;
 
-  const found: { target: SweepTarget; platform: string; token: string; foundAt: string; board: AtsBoard | null; rawBody: string | null }[] =
-    [];
+  const pending: CrawlHit[] = [];
+
+  // Persist as we go rather than buffering the whole crawl — same rationale as
+  // the sweep's flush: a long run must not lose everything to one mid-run
+  // failure, and a resolved token is durable the moment it is written.
+  const flush = () => {
+    if (pending.length === 0) return;
+    const batch = pending.splice(0, pending.length);
+    const jobs = batch.reduce((n, h) => n + (h.board?.jobs.length ?? 0), 0);
+    const write = () =>
+      tx(db, () => {
+        for (const f of batch) {
+          const evidenceId = storeRaw(db, 'careers_page', f.foundAt, 200, f.rawBody ?? f.foundAt);
+          observeCompany(db, f.target.id, 'atsPlatform', f.platform, 'careers_page', evidenceId, 'high');
+          observeCompany(db, f.target.id, 'atsToken', f.token, 'careers_page', evidenceId, 'high');
+          observeCompany(db, f.target.id, 'careersUrl', f.foundAt, 'careers_page', evidenceId, 'high');
+          resolved++;
+          if (f.board) {
+            const r = upsertReqs(db, f.target.id, f.board.platform, f.board.jobs, evidenceId, f.target.domain);
+            roles += r.opened + r.updated + r.reposted;
+          }
+        }
+      });
+    // FTS triggers dominate large inserts; drop and rebuild past a couple thousand.
+    if (jobs > 2000) bulkLoadReqs(db, write);
+    else write();
+  };
+
+  const push = (hit: CrawlHit) => {
+    pending.push(hit);
+    if (pending.length >= SWEEP_FLUSH_EVERY) flush();
+  };
 
   await mapLimit(
     targets,
     Math.max(2, Math.floor(crawl.concurrency / 2)),
     async (target) => {
-      if (blocked || ctx.cancelled() || !target.website) return null;
+      if (ctx.cancelled() || !target.website) return null;
       let probe;
       try {
         probe = await resolveAtsFromCareersPage(target.website);
-      } catch (err) {
-        if (isBlockSignal(err)) blocked = true;
+      } catch {
+        // The company's own site failing (or blocking us) says nothing about
+        // any other target or any ATS host — skip this one and keep crawling.
         return null;
       }
       if (!probe) return null;
 
       const fetcher = ATS_FETCHERS[probe.platform as keyof typeof ATS_FETCHERS];
-      if (!fetcher) {
-        found.push({ target, platform: probe.platform, token: probe.token, foundAt: probe.foundAt, board: null, rawBody: null });
+      const platform = probe.platform as AtsPlatform;
+      if (!fetcher || blockedPlatforms.has(platform)) {
+        // No adapter (workday, rippling, …) or the platform told us to stop:
+        // still record the resolved platform+token — the sweep's refresh pass
+        // fetches the board once the host is willing again.
+        push({ target, platform: probe.platform, token: probe.token, foundAt: probe.foundAt, board: null, rawBody: null });
         return null;
       }
       try {
         const result = await fetcher(probe.token);
-        if (result.httpStatus === 429 || result.httpStatus === 403) {
-          blocked = true;
-          return null;
-        }
-        found.push({
+        // A 429/403 blocks that one platform for the rest of the crawl, never
+        // the others. SmartRecruiters can 429 on page 2+ with page 1 in hand;
+        // that partial board is real data and is kept.
+        if (result.httpStatus === 429 || result.httpStatus === 403) blockedPlatforms.add(platform);
+        push({
           target,
           platform: probe.platform,
           token: probe.token,
@@ -1049,28 +1214,21 @@ export async function ingestCareersCrawl(db: Db, ctx: RunCtx): Promise<SourceOut
           rawBody: result.rawBody ?? null,
         });
       } catch (err) {
-        if (isBlockSignal(err)) blocked = true;
+        if (isBlockSignal(err)) blockedPlatforms.add(platform);
       }
       return null;
     },
     { jitterMs: 250, onProgress: (done, total) => ctx.progress(done, total) },
   );
 
-  tx(db, () => {
-    for (const f of found) {
-      const evidenceId = storeRaw(db, 'careers_page', f.foundAt, 200, f.rawBody ?? f.foundAt);
-      observeCompany(db, f.target.id, 'atsPlatform', f.platform, 'careers_page', evidenceId, 'high');
-      observeCompany(db, f.target.id, 'atsToken', f.token, 'careers_page', evidenceId, 'high');
-      observeCompany(db, f.target.id, 'careersUrl', f.foundAt, 'careers_page', evidenceId, 'high');
-      resolved++;
-      if (f.board) {
-        const r = upsertReqs(db, f.target.id, f.board.platform, f.board.jobs, evidenceId, f.target.domain);
-        roles += r.opened + r.updated + r.reposted;
-      }
-    }
-  });
+  flush();
 
-  if (blocked) ctx.log('warn', 'A host asked us to stop; the crawl ended early and did not retry.');
+  if (blockedPlatforms.size > 0) {
+    ctx.log(
+      'warn',
+      `Rate-limited by ${[...blockedPlatforms].join(', ')} — those platforms were skipped for the rest of this crawl.`,
+    );
+  }
   return { records: resolved, message: `${resolved} boards recovered from careers pages, ${roles} roles` };
 }
 

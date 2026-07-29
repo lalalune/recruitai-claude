@@ -84,7 +84,7 @@ export interface RecruiterSignal {
   headcount: number | null;
   headcountRange: string | null;
   industry: string | null;
-  method: 'voyager' | 'dom';
+  method: 'dom';
   sourceUrl: string;
   fetchedAt: string;
   rawBody: string;
@@ -118,6 +118,18 @@ const MAX_PROFILES_PER_PAGE = 60;
 const RAW_BODY_CAP = 200_000;
 const SPA_SETTLE_TIMEOUT_MS = 18_000;
 
+/** Current SPA settle budget; only tests ever change it (see the seam below). */
+let spaSettleTimeoutMs = SPA_SETTLE_TIMEOUT_MS;
+
+/**
+ * Test seam. The settle poll spends up to 18 real seconds waiting for people
+ * cards, which is right for a live SPA and wrong for a unit test proving what
+ * happens when they never appear. Production never calls this.
+ */
+export function __setSpaSettleTimeoutForTests(ms: number | null): void {
+  spaSettleTimeoutMs = ms ?? SPA_SETTLE_TIMEOUT_MS;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Worker window — hidden, on the same persistent partition as the login window
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,7 +140,12 @@ let electronNs: ElectronNs | null | undefined;
 async function electron(): Promise<ElectronNs | null> {
   if (electronNs !== undefined) return electronNs;
   try {
-    const ns = (await import('electron')) as unknown as ElectronNs;
+    // require, not a native dynamic import — see the twin helper in session.ts
+    // for why: the CJS require is the seam the test electron stub patches, and
+    // it is what every real runtime of this bundle provides anyway.
+    const ns = (
+      typeof require === 'function' ? require('electron') : await import('electron')
+    ) as unknown as ElectronNs;
     electronNs = ns && typeof ns.BrowserWindow === 'function' ? ns : null;
   } catch {
     electronNs = null;
@@ -343,7 +360,7 @@ async function harvestDom(wc: WebContents): Promise<DomHarvest | null> {
  * or the budget of patience runs out.
  */
 async function waitForPeople(wc: WebContents): Promise<DomHarvest | null> {
-  const deadline = Date.now() + SPA_SETTLE_TIMEOUT_MS;
+  const deadline = Date.now() + spaSettleTimeoutMs;
   let last: DomHarvest | null = null;
   while (Date.now() < deadline) {
     last = await harvestDom(wc);
@@ -505,67 +522,6 @@ function str(v: Json): string | null {
     if (typeof text === 'string') return text.trim() || null;
   }
   return null;
-}
-
-/**
- * Shape-agnostic on purpose: Voyager response envelopes are renamed regularly,
- * but a person object has always carried a public identifier plus some text
- * node for the name and headline. Matching on those survives envelope churn.
- */
-function harvestVoyagerPeople(json: Json, companyName: string | null): LinkedInPerson[] {
-  const out = new Map<string, LinkedInPerson>();
-
-  walkJson(json, (obj) => {
-    let publicId: string | null = null;
-    const pid = obj.publicIdentifier;
-    if (typeof pid === 'string' && pid && pid !== 'UNKNOWN') publicId = pid;
-
-    if (!publicId) {
-      for (const key of ['navigationUrl', 'profileUrl', 'url']) {
-        const v = obj[key];
-        if (typeof v === 'string') {
-          const m = v.match(/linkedin\.com\/in\/([^/?#]+)/);
-          if (m) {
-            publicId = decodeURIComponent(m[1]!);
-            break;
-          }
-        }
-      }
-    }
-    if (!publicId) return;
-
-    const first = typeof obj.firstName === 'string' ? obj.firstName : null;
-    const last = typeof obj.lastName === 'string' ? obj.lastName : null;
-    const name =
-      (first || last ? `${first ?? ''} ${last ?? ''}`.trim() : null) ??
-      str(obj.title) ??
-      str(obj.name) ??
-      str(obj.fullName) ??
-      prettifySlug(publicId);
-    if (!name) return;
-
-    const headline =
-      str(obj.primarySubtitle) ??
-      str(obj.headline) ??
-      str(obj.occupation) ??
-      str(obj.subline) ??
-      str(obj.secondarySubtitle) ??
-      null;
-
-    const existing = out.get(publicId);
-    if (existing && existing.headline && !headline) return;
-
-    out.set(publicId, {
-      fullName: cleanName(name),
-      headline,
-      title: headline,
-      publicProfileUrl: `https://www.linkedin.com/in/${publicId}`,
-      companyName,
-      persona: personaFromTitle(headline),
-    });
-  });
-
-  return [...out.values()];
 }
 
 function harvestNumber(json: Json, keys: string[]): number | null {
@@ -749,7 +705,7 @@ export async function getCompanyProfile(companyUrl: string): Promise<LinkedInCom
 
 interface PeopleResult {
   people: LinkedInPerson[];
-  method: 'voyager' | 'dom';
+  method: 'dom';
   sourceUrl: string;
   bodyText: string;
   rawBody: string;
@@ -758,9 +714,10 @@ interface PeopleResult {
 
 /**
  * One paid navigation to the company's People tab with a keyword filter, then
- * a free DOM harvest of that page; Voyager is only attempted if the DOM route
- * produced nothing, which is the ordering that costs the least when the DOM
- * route works and still recovers when LinkedIn changes the rendering.
+ * a free DOM harvest of that page. There is deliberately no search fallback:
+ * the People tab is the only surface whose results are actually scoped to the
+ * company, so when its harvest fails the only honest outcome is inconclusive
+ * (null) — never a broader query whose hits would be misattributed here.
  */
 async function peopleAtCompany(slug: string, keywords: string): Promise<PeopleResult | null> {
   const slot = await acquireRequestSlot(1);
@@ -808,39 +765,19 @@ async function peopleAtCompany(slug: string, keywords: string): Promise<PeopleRe
     };
   }
 
-  const csrf = await getCsrfToken();
-  if (!csrf) return null;
-  const slot2 = await acquireRequestSlot(1);
-  if (!slot2.ok) return null;
-
-  // Legacy blended search. Kept as a fallback because it needs no version-pinned
-  // GraphQL queryId; when it is gone the call simply returns nothing.
-  const apiUrl =
-    'https://www.linkedin.com/voyager/api/search/blended' +
-    `?count=49&keywords=${encodeURIComponent(keywords)}` +
-    '&origin=FACETED_SEARCH&q=all&start=0' +
-    `&filters=${encodeURIComponent('List(resultType->PEOPLE)')}` +
-    `&queryContext=${encodeURIComponent('List(spellCorrectionEnabled->true)')}`;
-
-  const res = await pageFetch(wc, apiUrl, csrf);
-  if (!res || res.status < 200 || res.status >= 300 || !res.body) return null;
-
-  let people: LinkedInPerson[] = [];
-  try {
-    people = harvestVoyagerPeople(JSON.parse(res.body) as Json, null);
-  } catch {
-    return null;
-  }
-  if (people.length === 0) return null;
-
-  return {
-    people: people.slice(0, MAX_PROFILES_PER_PAGE),
-    method: 'voyager',
-    sourceUrl: apiUrl,
-    bodyText: '',
-    rawBody: res.body.slice(0, RAW_BODY_CAP),
-    truncated: people.length >= MAX_PROFILES_PER_PAGE,
-  };
+  // There used to be a Voyager blended-search fallback here for the case where
+  // the People tab rendered but no cards could be harvested. It is gone on
+  // purpose: that endpoint took only the keyword query, with no company facet,
+  // so its results were GLOBAL matches — strangers who merely have "recruiter"
+  // in their headline — silently attributed to this company. countRecruiters()
+  // would then report in-house TA that does not exist, and findDecisionMakers()
+  // would store unrelated people as this company's contacts. A fallback that
+  // broadens scope does not degrade gracefully, it fabricates. Adding a company
+  // facet is not a fix either: Voyager's facet syntax is unversioned and cannot
+  // be verified from here, and a silently wrong facet is this same bug again.
+  // When the DOM harvest fails, the answer the module header promises is the
+  // right one — inconclusive, so null.
+  return null;
 }
 
 /**

@@ -5,7 +5,8 @@
  * renderer — the Settings object exposes only whether a key is present.
  */
 
-import { ipcMain, shell } from 'electron';
+import { shell } from 'electron';
+import { handle } from './guard.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getDb, all, get, run, tx, backup, type Db } from '../db/index.js';
@@ -26,6 +27,12 @@ import {
   SECRET_VERIFIER,
 } from '../settings.js';
 import { emitEvent } from '../pipeline/run.js';
+import { recomputeCompany } from '../pipeline/scoring.js';
+import {
+  companySuppressionValues,
+  COMPANY_MATCHES_VALUE,
+  COMPANY_SUPPRESSION_MATCH,
+} from '../pipeline/suppression.js';
 import { auditLog } from './companies.js';
 import { addSuppressionRow } from './outreach.js';
 import * as gmail from '../gmail/index.js';
@@ -89,13 +96,30 @@ export function addSuppression(db: Db, kind: string, value: string, reason: stri
       );
       run(db, `UPDATE company SET status = 'suppressed', updated_at = ? WHERE lower(domain) = ?`, Date.now(), clean);
     } else {
-      run(
-        db,
-        `UPDATE draft SET state = 'skipped', scheduled_at = NULL, updated_at = ? WHERE state IN ('draft','queued') AND company_id = ?`,
-        Date.now(),
-        value.trim(),
-      );
-      run(db, `UPDATE company SET status = 'suppressed', updated_at = ? WHERE id = ?`, Date.now(), value.trim());
+      // Company suppressions accept an id, a domain, or a typed name — match
+      // all three identities, exactly as the queue barriers do. An ambiguous
+      // pre-emptive value ("Node.js") resolves to BOTH readings; the side
+      // effects run for each.
+      for (const cval of companySuppressionValues(db, value)) {
+        run(
+          db,
+          `UPDATE draft SET state = 'skipped', scheduled_at = NULL, updated_at = ?
+            WHERE state IN ('draft','queued')
+              AND company_id IN (SELECT company.id FROM company WHERE ${COMPANY_MATCHES_VALUE})`,
+          Date.now(),
+          cval,
+          cval,
+          cval,
+        );
+        run(
+          db,
+          `UPDATE company SET status = 'suppressed', updated_at = ? WHERE ${COMPANY_MATCHES_VALUE}`,
+          Date.now(),
+          cval,
+          cval,
+          cval,
+        );
+      }
     }
     auditLog(db, {
       actor: 'operator',
@@ -107,20 +131,67 @@ export function addSuppression(db: Db, kind: string, value: string, reason: stri
   });
 
   emitEvent('data:changed', { entity: 'company' });
+  emitEvent('data:changed', { entity: 'suppression' });
 }
 
 export function removeSuppression(db: Db, id: number): void {
   const row = get<SuppressionRow>(db, 'SELECT * FROM suppression WHERE id = ?', id);
   if (!row) return;
-  run(db, 'DELETE FROM suppression WHERE id = ?', id);
-  auditLog(db, {
-    actor: 'operator',
-    action: 'removeSuppression',
-    entity: 'suppression',
-    entityId: String(id),
-    before: row,
+
+  const restored: string[] = [];
+  tx(db, () => {
+    run(db, 'DELETE FROM suppression WHERE id = ?', id);
+
+    // Un-suppression must be possible: a company whose status is 'suppressed'
+    // and which no remaining rule matches goes back through scoring, otherwise
+    // a mistaken suppression is permanent (status 'suppressed' short-circuits
+    // recomputeCompany forever).
+    //
+    // Scoped to companies THIS row could have matched — an unscoped sweep also
+    // flipped companies the operator suppressed manually with no rule at all.
+    let candidatesSql: string | null = null;
+    let candidateArgs: string[] = [];
+    if (row.kind === 'domain') {
+      candidatesSql = `co.domain IS NOT NULL AND lower(co.domain) = ?`;
+      candidateArgs = [row.value.toLowerCase()];
+    } else if (row.kind === 'company') {
+      candidatesSql = `(upper(?) = co.id OR ? = co.name_norm OR (co.domain IS NOT NULL AND ? = lower(co.domain)))`;
+      candidateArgs = [row.value, row.value, row.value];
+    }
+    // Email-kind rows never flipped a company's status; nothing to restore.
+
+    const stuck = candidatesSql
+      ? all<{ id: string }>(
+          db,
+          `SELECT co.id FROM company co
+            WHERE co.status = 'suppressed'
+              AND ${candidatesSql}
+              AND NOT EXISTS (
+                SELECT 1 FROM suppression s
+                 WHERE (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH})
+                    OR (s.kind = 'domain' AND co.domain IS NOT NULL AND lower(s.value) = lower(co.domain))
+              )`,
+          ...candidateArgs,
+        )
+      : [];
+    for (const c of stuck) {
+      run(db, `UPDATE company SET status = 'scored', updated_at = ? WHERE id = ?`, Date.now(), c.id);
+      restored.push(c.id);
+    }
+
+    auditLog(db, {
+      actor: 'operator',
+      action: 'removeSuppression',
+      entity: 'suppression',
+      entityId: String(id),
+      before: row,
+      after: restored.length ? { restoredCompanies: restored } : undefined,
+    });
   });
+
+  for (const cid of restored) recomputeCompany(db, cid);
   emitEvent('data:changed', { entity: 'company' });
+  emitEvent('data:changed', { entity: 'suppression' });
 }
 
 /**
@@ -164,9 +235,49 @@ export function importSuppressionsCsv(db: Db, csv: string): number {
       addSuppressionRow(db, kind, raw, reason, note);
       imported++;
     }
+
+    // The same side effects addSuppression applies one-by-one, run set-based
+    // over the whole table (idempotent): without this, imported identities
+    // kept their queued drafts visible-but-unsendable and their companies
+    // 'approved'.
+    if (imported > 0) {
+      run(
+        db,
+        `UPDATE draft SET state = 'skipped', scheduled_at = NULL, updated_at = ?
+          WHERE state IN ('draft','queued')
+            AND contact_id IN (
+              SELECT c.id FROM contact c
+               WHERE c.email IS NOT NULL AND EXISTS (
+                 SELECT 1 FROM suppression s
+                  WHERE (s.kind = 'email'  AND lower(s.value) = lower(c.email))
+                     OR (s.kind = 'domain' AND lower(s.value) = lower(substr(c.email, instr(c.email, '@') + 1)))))`,
+        Date.now(),
+      );
+      run(
+        db,
+        `UPDATE draft SET state = 'skipped', scheduled_at = NULL, updated_at = ?
+          WHERE state IN ('draft','queued')
+            AND company_id IN (
+              SELECT co.id FROM company co
+               WHERE EXISTS (SELECT 1 FROM suppression s WHERE s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH}))`,
+        Date.now(),
+      );
+      run(
+        db,
+        `UPDATE company AS co SET status = 'suppressed', updated_at = ?
+          WHERE co.status != 'suppressed'
+            AND EXISTS (
+              SELECT 1 FROM suppression s
+               WHERE (s.kind = 'domain' AND co.domain IS NOT NULL AND lower(s.value) = lower(co.domain))
+                  OR (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH}))`,
+        Date.now(),
+      );
+    }
   });
 
   emitEvent('data:changed', { entity: 'company' });
+  emitEvent('data:changed', { entity: 'draft' });
+  emitEvent('data:changed', { entity: 'suppression' });
   return imported;
 }
 
@@ -248,7 +359,7 @@ const EXPORTS: Record<'companies' | 'contacts' | 'drafts', { headers: string[]; 
                  (SELECT count(*) FROM contact ct WHERE ct.company_id = c.id) AS contact_count,
                  (SELECT count(*) FROM contact ct WHERE ct.company_id = c.id AND ct.email_verdict = 'valid') AS verified_contact_count,
                  c.notes, c.created_at, c.updated_at
-            FROM company c WHERE c.canonical_id IS NULL
+            FROM company c WHERE c.canonical_id IS NULL /*SCOPE*/
            ORDER BY c.quality_score DESC, c.open_req_count DESC`,
   },
   contacts: {
@@ -266,8 +377,8 @@ const EXPORTS: Record<'companies' | 'contacts' | 'drafts', { headers: string[]; 
                           WHERE (s.kind = 'email' AND lower(s.value) = lower(c.email))
                              OR (s.kind = 'domain' AND c.email IS NOT NULL
                                  AND lower(s.value) = lower(substr(c.email, instr(c.email, '@') + 1)))
-                             OR (s.kind = 'company' AND s.value = co.id)) AS suppressed
-            FROM contact c JOIN company co ON co.id = c.company_id
+                             OR (s.kind = 'company' AND ${COMPANY_SUPPRESSION_MATCH})) AS suppressed
+            FROM contact c JOIN company co ON co.id = c.company_id WHERE 1=1 /*SCOPE*/
            ORDER BY co.quality_score DESC, c.contact_score DESC`,
   },
   drafts: {
@@ -283,15 +394,31 @@ const EXPORTS: Record<'companies' | 'contacts' | 'drafts', { headers: string[]; 
             JOIN contact c ON c.id = d.contact_id
             JOIN company co ON co.id = d.company_id
             LEFT JOIN send s ON s.draft_id = d.id
+           WHERE 1=1 /*SCOPE*/
            ORDER BY d.created_at DESC`,
   },
 };
 
-export function exportCsv(db: Db, what: 'companies' | 'contacts' | 'drafts'): string {
+/** Which column scopes each export when a company-id list is passed. */
+const EXPORT_SCOPE_COL: Record<'companies' | 'contacts' | 'drafts', string> = {
+  companies: 'c.id',
+  contacts: 'c.company_id',
+  drafts: 'd.company_id',
+};
+
+export function exportCsv(db: Db, what: 'companies' | 'contacts' | 'drafts', companyIds?: string[]): string {
   const spec = EXPORTS[what];
   if (!spec) throw new Error(`Unknown export: ${what}`);
 
-  const rows = all<Record<string, unknown>>(db, spec.sql);
+  let sql = spec.sql.replace('/*SCOPE*/', '');
+  let args: string[] = [];
+  if (companyIds && companyIds.length > 0) {
+    const ph = companyIds.map(() => '?').join(',');
+    sql = spec.sql.replace('/*SCOPE*/', `AND ${EXPORT_SCOPE_COL[what]} IN (${ph})`);
+    args = companyIds;
+  }
+
+  const rows = all<Record<string, unknown>>(db, sql, ...args);
   const dir = exportsDir();
   fs.mkdirSync(dir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -347,7 +474,17 @@ async function testVerifierKey(db: Db): Promise<{ ok: boolean; message: string }
   if (provider === 'none') return { ok: false, message: 'No verification provider selected in Settings.' };
   if (!(await readSecret(SECRET_VERIFIER))) return { ok: false, message: `No ${provider} key saved.` };
   try {
-    return await verify.testVerifierKey(db);
+    const result = await verify.testVerifierKey(db);
+    // The measured accuracy of pattern-guessed addresses so far — the number
+    // that says whether paying to verify guesses is worth it on this ICP.
+    const acc = verify.measuredPatternAccuracy(db);
+    if (result.ok && acc.rate != null) {
+      return {
+        ok: true,
+        message: `${result.message} Pattern-guess accuracy so far: ${(acc.rate * 100).toFixed(0)}% over ${acc.valid + acc.invalid} conclusive checks.`,
+      };
+    }
+    return result;
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : String(err) };
   }
@@ -383,18 +520,18 @@ export function getScreenshot(relPath: string): string | null {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function registerSettingsIpc(): void {
-  ipcMain.handle('getSettings', async () => getSettings());
+  handle('getSettings', async () => getSettings());
 
-  ipcMain.handle('patchSettings', async (_e, patch: SettingsPatch) => patchSettings(patch ?? {}));
+  handle('patchSettings', async (patch: SettingsPatch) => patchSettings(patch));
 
-  ipcMain.handle('setSecret', async (_e, key: string, value: string) => {
-    const raw = String(key ?? '').trim().toLowerCase();
+  handle('setSecret', async (key: string, value: string) => {
+    const raw = key.trim().toLowerCase();
 
     // Not actually a secret. SettingsPatch has no `keys` branch, so the choice
     // of verification provider rides the same channel as the key it selects;
     // it is stored as an ordinary setting rather than encrypted.
     if (raw === 'verifier_provider' || raw === 'verifierprovider') {
-      const provider = VERIFIER_PROVIDERS.has(String(value)) ? String(value) : 'none';
+      const provider = VERIFIER_PROVIDERS.has(value) ? value : 'none';
       setSetting('keys.verifierProvider', provider);
       auditLog(getDb(), {
         actor: 'operator',
@@ -407,42 +544,44 @@ export function registerSettingsIpc(): void {
     }
 
     const normalised = normaliseSecretKey(raw);
-    await writeSecret(normalised, String(value ?? ''));
+    await writeSecret(normalised, value);
     auditLog(getDb(), { actor: 'operator', action: 'setSecret', entity: 'setting', entityId: normalised });
   });
 
-  ipcMain.handle('testKey', async (_e, which: 'verifier' | 'anthropic') =>
+  handle('testKey', async (which: 'verifier' | 'anthropic') =>
     which === 'anthropic' ? testAnthropicKey() : testVerifierKey(getDb()),
   );
 
-  ipcMain.handle('connectGmail', async () => {
+  handle('connectGmail', async () => {
     const result = await gmail.connectGmail();
     emitEvent('data:changed', { entity: 'draft' });
     return result;
   });
 
-  ipcMain.handle('disconnectGmail', async () => {
+  handle('disconnectGmail', async () => {
     await gmail.disconnectGmail();
   });
 
-  ipcMain.handle('testGmail', async () => gmail.testConnection());
+  handle('testGmail', async () => gmail.testConnection());
 
   // suppression
-  ipcMain.handle('listSuppressions', async () => listSuppressions(getDb()));
-  ipcMain.handle('addSuppression', async (_e, kind: string, value: string, reason: string, note?: string) => {
+  handle('listSuppressions', async () => listSuppressions(getDb()));
+  handle('addSuppression', async (kind: string, value: string, reason: string, note?: string) => {
     addSuppression(getDb(), kind, value, reason, note);
   });
-  ipcMain.handle('removeSuppression', async (_e, id: number) => {
-    removeSuppression(getDb(), Number(id));
+  handle('removeSuppression', async (id: number) => {
+    removeSuppression(getDb(), id);
   });
-  ipcMain.handle('importSuppressionsCsv', async (_e, csv: string) => importSuppressionsCsv(getDb(), String(csv ?? '')));
+  handle('importSuppressionsCsv', async (csv: string) => importSuppressionsCsv(getDb(), csv));
 
   // misc
-  ipcMain.handle('getStats', async () => getStats(getDb()));
+  handle('getStats', async () => getStats(getDb()));
 
-  ipcMain.handle('exportCsv', async (_e, what: 'companies' | 'contacts' | 'drafts') => exportCsv(getDb(), what));
+  handle('exportCsv', async (what: 'companies' | 'contacts' | 'drafts', companyIds?: string[]) =>
+    exportCsv(getDb(), what, companyIds),
+  );
 
-  ipcMain.handle('backupNow', async () => {
+  handle('backupNow', async () => {
     const dir = backupsDir();
     fs.mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -451,20 +590,20 @@ export function registerSettingsIpc(): void {
     return dest;
   });
 
-  ipcMain.handle('openDataDir', async () => {
+  handle('openDataDir', async () => {
     const dir = getDataDir();
     fs.mkdirSync(dir, { recursive: true });
     await shell.openPath(dir);
   });
 
-  ipcMain.handle('openExternal', async (_e, url: string) => {
-    // Only ever hand http(s) to the OS handler; anything else could be a
-    // file:// or custom-scheme link arriving from scraped page content.
+  handle('openExternal', async (url: string) => {
+    // The schema already enforces http(s); this second check is deliberate
+    // defence in depth at the OS boundary, in case the schema ever loosens.
     if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
       throw new Error('Only http and https links can be opened externally.');
     }
     await shell.openExternal(url);
   });
 
-  ipcMain.handle('getScreenshot', async (_e, relPath: string) => getScreenshot(relPath));
+  handle('getScreenshot', async (relPath: string) => getScreenshot(relPath));
 }

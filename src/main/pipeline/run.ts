@@ -12,6 +12,7 @@ import { getDb, all, get, type Db } from '../db/index.js';
 import { BlockedError } from '../util/http.js';
 import { getSetting, setSetting, getCrawl, getSpendCapUsd, hasSecret, SECRET_VERIFIER, SECRET_ANTHROPIC } from '../settings.js';
 import { spendByProvider, requeueStale, SpendCapExceeded } from './tasks.js';
+import { SpendCapError } from '../verify/verifier.js';
 import { ingestYc, ingestAtsSweep, ingestCareersCrawl, ingestHn, ingestSecFormD } from './ingest.js';
 import { scoreAll, recomputeCompany } from './scoring.js';
 import { generateAllDrafts } from './drafts.js';
@@ -81,11 +82,6 @@ function gate(alias: string): string {
 const ENRICHMENT_GATE = gate('');
 const ENRICHMENT_GATE_CO = gate('co');
 
-function countGatedCompanies(db: Db): number {
-  const row = get<{ n: number }>(db, `SELECT count(*) AS n FROM company WHERE ${ENRICHMENT_GATE}`);
-  return row?.n ?? 0;
-}
-
 function countUnverifiedContacts(db: Db): number {
   const row = get<{ n: number }>(
     db,
@@ -148,11 +144,20 @@ async function runEmailVerify(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
   for (const [i, t] of targets.entries()) {
     if (ctx.cancelled()) break;
     try {
-      await verifyCompanyContacts(db, t.id, { tryCandidates: true });
+      const report = await verifyCompanyContacts(db, t.id, { tryCandidates: true });
       recomputeCompany(db, t.id);
+      if (report.blocked) {
+        // Rule 3 in verifier.ts: a 429/403 stops the RUN, not just the company —
+        // continuing would knock on a provider that already said no. The
+        // blocked company is not counted: it was cut off mid-way.
+        ctx.log('warn', 'Verification provider returned 429/403 — stopping the run.');
+        break;
+      }
       done++;
     } catch (err) {
-      if (err instanceof SpendCapExceeded) {
+      // Two spend-stop classes exist: the ledger's (tasks.ts) and the
+      // verifier's own (verifier.ts). Either one means stop, not skip.
+      if (err instanceof SpendCapExceeded || err instanceof SpendCapError) {
         ctx.log('warn', `${err.message} — stopping verification.`);
         break;
       }
@@ -168,11 +173,31 @@ async function runLinkedin(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
   if (!crawl.linkedinEnabled) {
     return { records: 0, message: 'LinkedIn is disabled in Settings (off by default, deliberately)' };
   }
+  // The session layer enforces the real per-day request budget; size this
+  // run's target list from what is LEFT today, not the full daily number —
+  // otherwise each run of the source selects a fresh full-budget batch.
+  const status = await linkedin.getStatus();
   if (!(await linkedin.isAvailable())) {
-    return { records: 0, message: 'LinkedIn session unavailable — sign in from Settings first' };
+    // Say WHY: "sign in first" on a budget-exhausted or day-halted session
+    // sends the operator to fix the wrong thing.
+    const why =
+      status.state === 'budget_exhausted'
+        ? `daily request budget used (${status.budgetUsed}/${status.budgetPerDay}) — resumes tomorrow`
+        : status.haltReason
+          ? `halted for the day (${status.haltReason})`
+          : status.message || 'sign in from Settings first';
+    return { records: 0, message: `LinkedIn unavailable — ${why}` };
   }
 
-  const budget = crawl.linkedinPerDay;
+  const remaining = Math.max(0, status.budgetRemaining);
+  // Each company costs roughly two requests (recruiter count + people search).
+  const budget = Math.floor(remaining / 2);
+  if (budget === 0) {
+    return {
+      records: 0,
+      message: `Only ${remaining} LinkedIn request${remaining === 1 ? '' : 's'} left today — a company needs two. Try tomorrow.`,
+    };
+  }
   // The LinkedIn adapter is keyed on the company's LinkedIn URL, so a company
   // without one simply isn't reachable by this source.
   const targets = all<{ id: string; linkedin_url: string }>(
@@ -183,7 +208,7 @@ async function runLinkedin(db: Db, ctx: RunCtx): Promise<SourceOutcome> {
     budget,
   );
 
-  ctx.log('info', `Checking in-house recruiter headcount for ${targets.length} companies (daily budget ${budget}).`);
+  ctx.log('info', `Checking in-house recruiter headcount for ${targets.length} companies (${remaining} requests left today).`);
   ctx.progress(0, targets.length);
 
   let done = 0;
@@ -310,10 +335,9 @@ const SOURCES: Record<SourceKey, SourceDef> = {
     description: 'Finds decision makers at companies that scored well but have no reachable address.',
     defaultEnabled: true,
     requiresKey: null,
-    estimateCostUsd: (db) => {
-      const n = countGatedCompanies(db);
-      return n === 0 ? null : Math.round(n * 0.05 * 100) / 100;
-    },
+    // Free by design: discoverContacts touches nothing beyond DNS. Inventing a
+    // per-company dollar figure here made a $0 step look like a paid one.
+    estimateCostUsd: () => null,
     run: runContactDiscovery,
   },
   email_verify: {
@@ -488,18 +512,31 @@ export async function runSource(key: SourceKey): Promise<void> {
     return;
   }
 
+  // Claim BEFORE any await — the key-availability check below suspends, and a
+  // second Run click landing in that gap would start a concurrent run.
+  anyRunning = true;
   const def = SOURCES[key];
-  if (def.requiresKey === 'verifier' && !(await hasSecret(SECRET_VERIFIER))) {
+  if (def.requiresKey === 'verifier' && !(await verifierKeyAvailable())) {
+    anyRunning = false;
     appendLog(key, 'error', 'No verifier API key configured — add one in Settings.');
     emitProgress(true);
     return;
   }
 
-  anyRunning = true;
   stopRequested = false;
   await runOne(key, def);
   anyRunning = false;
   emitProgress(true);
+}
+
+/**
+ * A verifier key can live in Settings (secret store) or in the environment —
+ * loadVerifierConfig honours RECRUITAI_VERIFIER_KEY, so gating on the secret
+ * store alone refused to run for env-configured setups.
+ */
+async function verifierKeyAvailable(): Promise<boolean> {
+  if (process.env.RECRUITAI_VERIFIER_KEY) return true;
+  return hasSecret(SECRET_VERIFIER);
 }
 
 /** Run every enabled source in dependency order (discovery → score → enrich → draft). */
@@ -518,7 +555,7 @@ export async function runAll(): Promise<void> {
     if (!isSourceEnabled(key)) continue;
 
     const def = SOURCES[key];
-    if (def.requiresKey === 'verifier' && !(await hasSecret(SECRET_VERIFIER))) {
+    if (def.requiresKey === 'verifier' && !(await verifierKeyAvailable())) {
       appendLog(key, 'warn', 'Skipped: no verifier API key configured.');
       continue;
     }

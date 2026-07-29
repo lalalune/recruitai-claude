@@ -57,6 +57,17 @@ export function EvidenceViewer({ shots, index, onIndexChange }: EvidenceViewerPr
   const shot = open ? shots[index] : null;
   const { data } = useScreenshot(shot?.relPath ?? null);
 
+  // If the shot list shrinks under the stored index (selection moved to a
+  // company with fewer screenshots), clamp or clear it. Otherwise the store
+  // still says "lightbox open" with nothing rendered, and every overlay-gated
+  // hotkey stays locked out with no visible way back.
+  useEffect(() => {
+    if (index == null) return;
+    if (shots.length === 0) onIndexChange(null);
+    else if (index >= shots.length) onIndexChange(shots.length - 1);
+    else if (index < 0) onIndexChange(0);
+  }, [index, shots.length, onIndexChange]);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {

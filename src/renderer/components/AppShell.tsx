@@ -1,13 +1,18 @@
 import { Keyboard, ListChecks, Moon, Send, Settings as SettingsIcon, Sun, Workflow } from 'lucide-react';
-import { useState, type ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { Toaster } from 'sonner';
 
 import type { DashboardStats } from '../../shared/ipc.js';
 import { num } from '../lib/format.js';
-import { cn, getTheme, setTheme, type Theme } from '../lib/utils.js';
+import { cn, type Theme } from '../lib/utils.js';
 import { useUi } from '../store/ui.js';
 
-export type ShellStats = DashboardStats & { sendToday?: number; sendLimit?: number };
+export type ShellStats = DashboardStats & {
+  sendToday?: number;
+  sendLimit?: number;
+  sendThisHour?: number;
+  sendHourlyLimit?: number;
+};
 
 export interface AppShellProps {
   screen: string;
@@ -25,17 +30,21 @@ const NAV = [
 
 export function AppShell({ screen, onNavigate, stats, children }: AppShellProps) {
   const setShortcutsOpen = useUi((s) => s.setShortcutsOpen);
-  const [theme, setThemeState] = useState<Theme>(() => getTheme());
+  const theme = useUi((s) => s.theme);
+  const setThemeChoice = useUi((s) => s.setThemeChoice);
 
   const cycleTheme = () => {
     const next: Theme = theme === 'dark' ? 'light' : theme === 'light' ? 'system' : 'dark';
-    setTheme(next);
-    setThemeState(next);
+    setThemeChoice(next);
   };
 
   const reviewed = stats ? `${num(stats.reviewed)} / ${num(stats.companies)} reviewed` : null;
   const sends =
     stats?.sendLimit != null ? `${num(stats.sendToday ?? stats.sent)} / ${num(stats.sendLimit)} today` : null;
+  const sendsHour =
+    stats?.sendHourlyLimit != null && stats.sendThisHour != null
+      ? `${num(stats.sendThisHour)} / ${num(stats.sendHourlyLimit)} this hour`
+      : null;
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-background text-foreground">
@@ -119,6 +128,12 @@ export function AppShell({ screen, onNavigate, stats, children }: AppShellProps)
             <span className="tabular-nums">{sends}</span>
           </>
         )}
+        {sendsHour && (
+          <>
+            <Dot />
+            <span className="tabular-nums">{sendsHour}</span>
+          </>
+        )}
         {stats && stats.replies > 0 && (
           <>
             <Dot />
@@ -135,7 +150,7 @@ export function AppShell({ screen, onNavigate, stats, children }: AppShellProps)
 
       <Toaster
         position="bottom-right"
-        theme="system"
+        theme={theme}
         closeButton
         toastOptions={{
           classNames: {

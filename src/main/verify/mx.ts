@@ -353,12 +353,17 @@ export async function lookupDomainMx(
       d,
     );
     const stored = row?.mx_provider;
-    if (stored && stored !== 'unknown') {
+    // 'none' is not servable from the durable cache: the row stores only the
+    // provider string, losing hasAddressRecord — reconstructing it as false
+    // flipped "no MX but has an A record" domains to invalid after a restart.
+    // Those domains are ~2.5% of the population; re-resolving them is cheap
+    // and keeps cold and warm caches giving the same verdict.
+    if (stored && stored !== 'unknown' && stored !== 'none') {
       const info: DomainMxInfo = {
         domain: d,
         provider: stored as MxProvider,
         hosts: [],
-        hasAddressRecord: stored !== 'none',
+        hasAddressRecord: true,
         nxdomain: false,
         transient: false,
         resolvedAt: Date.now(),

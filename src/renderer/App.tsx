@@ -2,8 +2,10 @@ import {
   Component,
   lazy,
   Suspense,
+  useCallback,
   useEffect,
   useMemo,
+  useRef,
   type ErrorInfo,
   type ReactNode,
 } from 'react';
@@ -14,8 +16,8 @@ import { AppShell } from './components/AppShell.js';
 import { CommandPalette, ShortcutsOverlay } from './components/CommandPalette.js';
 import { EmptyState } from './components/EmptyState.js';
 import { Button } from './components/ui/button.js';
-import { api, useSendStats, useStats } from './lib/api.js';
-import { getTheme, safeLocalGet, safeLocalSet, setTheme } from './lib/utils.js';
+import { api, useAppEventBridge, useSendStats, useStats } from './lib/api.js';
+import { safeLocalGet, safeLocalSet, SETUP_COMPLETE_KEY } from './lib/utils.js';
 import { useUi, type Command, type Screen } from './store/ui.js';
 
 const Review = lazy(() => import('./screens/Review.js'));
@@ -23,8 +25,6 @@ const Outreach = lazy(() => import('./screens/Outreach.js'));
 const Pipeline = lazy(() => import('./screens/Pipeline.js'));
 const Settings = lazy(() => import('./screens/Settings.js'));
 const Setup = lazy(() => import('./screens/Setup.js'));
-
-const SETUP_KEY = 'recruitai.setupComplete';
 
 export default function App() {
   const screen = useUi((s) => s.screen);
@@ -35,14 +35,24 @@ export default function App() {
   const setShortcutsOpen = useUi((s) => s.setShortcutsOpen);
   const screenCommands = useUi((s) => s.commands);
 
-  // First run drops straight into Setup; leaving it is what marks it done, so
-  // however Setup finishes (finish button, skip, or navigating away) it sticks.
+  const openSettings = useCallback(() => setScreen('settings'), [setScreen]);
+  useAppEventBridge({ onOpenSettings: openSettings });
+
+  // First run drops straight into Setup.
   useEffect(() => {
-    if (!safeLocalGet(SETUP_KEY)) setScreen('setup');
+    if (!safeLocalGet(SETUP_COMPLETE_KEY)) setScreen('setup');
   }, [setScreen]);
 
+  // Setup counts as done only on a real transition AWAY from it (Setup's own
+  // finish/skip also writes the flag). Writing on plain "screen !== 'setup'"
+  // would fire on first mount — the same commit that navigates TO setup — and
+  // quitting mid-wizard would then skip setup forever.
+  const prevScreenRef = useRef(screen);
   useEffect(() => {
-    if (screen !== 'setup') safeLocalSet(SETUP_KEY, '1');
+    if (prevScreenRef.current === 'setup' && screen !== 'setup') {
+      safeLocalSet(SETUP_COMPLETE_KEY, '1');
+    }
+    prevScreenRef.current = screen;
   }, [screen]);
 
   const { data: stats } = useStats({ refetchInterval: 30_000 });
@@ -72,9 +82,13 @@ export default function App() {
       })),
       {
         id: 'theme',
-        label: 'Toggle dark / light theme',
+        label: 'Cycle theme (dark / light / system)',
         group: 'App',
-        run: () => setTheme(getTheme() === 'dark' ? 'light' : 'dark'),
+        keywords: 'dark light appearance',
+        run: () => {
+          const { theme, setThemeChoice } = useUi.getState();
+          setThemeChoice(theme === 'dark' ? 'light' : theme === 'light' ? 'system' : 'dark');
+        },
       },
       {
         id: 'shortcuts',
@@ -82,6 +96,13 @@ export default function App() {
         group: 'App',
         hint: '?',
         run: () => setShortcutsOpen(true),
+      },
+      {
+        id: 'run-setup',
+        label: 'Run setup wizard',
+        group: 'App',
+        keywords: 'onboarding first run welcome',
+        run: () => setScreen('setup'),
       },
       {
         id: 'export-companies',
@@ -127,7 +148,13 @@ export default function App() {
   );
 
   const shellStats = stats
-    ? { ...stats, sendToday: sendStats?.today, sendLimit: sendStats?.dailyLimit }
+    ? {
+        ...stats,
+        sendToday: sendStats?.today,
+        sendLimit: sendStats?.dailyLimit,
+        sendThisHour: sendStats?.thisHour,
+        sendHourlyLimit: sendStats?.hourlyLimit,
+      }
     : undefined;
 
   const body = (
@@ -135,7 +162,7 @@ export default function App() {
       <Suspense fallback={<ScreenFallback />}>
         {screen === 'review' && <Review />}
         {screen === 'outreach' && <Outreach />}
-        {screen === 'pipeline' && <Pipeline />}
+        {screen === 'pipeline' && <Pipeline onNavigate={(s) => setScreen(s as Screen)} />}
         {screen === 'settings' && <Settings />}
         {screen === 'setup' && (
           <Setup open onClose={() => setScreen('review')} onNavigate={(s) => setScreen(s as Screen)} />

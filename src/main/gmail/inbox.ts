@@ -73,14 +73,20 @@ interface Classification {
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function syncInbox(): Promise<number> {
+export async function syncInbox(
+  // Injectable for tests; production callers take the default. The seam exists
+  // because the historyId resume semantics below are exactly the kind of logic
+  // that only ever goes wrong against a mailbox with more mail than a fixture.
+  clientFactory: () => Promise<gmail_v1.Gmail> = getGmailClient,
+): Promise<number> {
   if (!(await isConnected())) throw new GmailAuthError('Gmail is not connected.');
 
-  const api = await getGmailClient();
+  const api = await clientFactory();
   const stored = getSetting(KEY_HISTORY_ID);
 
   let ids: string[] = [];
   let nextHistoryId: string | null = null;
+  let scanComplete = false;
 
   if (stored) {
     const incremental = await listIncremental(api, stored);
@@ -93,14 +99,37 @@ export async function syncInbox(): Promise<number> {
   if (!nextHistoryId) {
     // Either first run, or Gmail 404'd an expired historyId. Either way, a
     // date-bounded search is the documented recovery.
-    ids = await listByQuery(api);
+    const scan = await listByQuery(api);
+    ids = scan.ids;
+    scanComplete = scan.complete;
+  }
+
+  const fresh = dedupe(ids).filter((id) => !alreadyStored(id));
+  const batch = fresh.slice(0, MAX_MESSAGES_PER_SYNC);
+
+  // INVARIANT: a historyId is persisted only when every message at or before it
+  // has been examined this sync or in a previous one. The slice above is the
+  // last place that can silently break that — if it cut anything, persist
+  // nothing; the next sync re-lists the same range, alreadyStored() makes the
+  // overlap idempotent, and each pass advances by a full batch.
+  const cutByCap = batch.length < fresh.length;
+
+  if (!nextHistoryId && scanComplete && !cutByCap) {
+    // The fallback scan drained its whole window, so "everything up to now is
+    // covered" is genuinely true and the current mailbox historyId is a sound
+    // anchor for incremental sync to resume from.
     const profile = await gmailCall(() => api.users.getProfile({ userId: 'me' }));
     nextHistoryId = profile.data.historyId ?? null;
   }
+  // A truncated fallback scan persists nothing on purpose: messages.list is a
+  // search with no resumable cursor, and anchoring at "now" would declare the
+  // unlisted remainder synced. Leaving the stored value untouched (absent, or
+  // expired) sends the next sync straight back here, where the filter above
+  // skips this batch and the scan advances. The cost when the stored id has
+  // expired is one 404'd history.list per pass — two quota units against the
+  // eighty-million-per-day budget described at the top of this file.
 
-  const fresh = dedupe(ids).filter((id) => !alreadyStored(id)).slice(0, MAX_MESSAGES_PER_SYNC);
-
-  const messages = await fetchMessages(api, fresh);
+  const messages = await fetchMessages(api, batch);
 
   let inserted = 0;
   for (const msg of messages) {
@@ -108,7 +137,7 @@ export async function syncInbox(): Promise<number> {
     if (persist(msg)) inserted++;
   }
 
-  if (nextHistoryId) setSetting(KEY_HISTORY_ID, nextHistoryId);
+  if (nextHistoryId && !cutByCap) setSetting(KEY_HISTORY_ID, nextHistoryId);
   markSilentSends();
 
   if (inserted > 0) emitGmailEvent('data:changed', { entity: 'inbound' });
@@ -125,7 +154,14 @@ async function listIncremental(
 ): Promise<{ ids: string[]; historyId: string } | null> {
   const ids: string[] = [];
   let pageToken: string | undefined;
+  // The anchor the next sync resumes from. It advances in two distinct ways:
+  // past each history record whose messages are all in `ids` (records carry
+  // their own mailbox sequence id), and to the response-level historyId only
+  // once the listing is fully drained. The response-level id is the mailbox's
+  // CURRENT position — persisting it after a truncated listing would skip
+  // every record between the cap and "now" forever.
   let historyId = startHistoryId;
+  let capped = false;
 
   try {
     do {
@@ -139,13 +175,29 @@ async function listIncremental(
         }),
       );
 
-      if (res.data.historyId) historyId = res.data.historyId;
       for (const record of res.data.history ?? []) {
-        for (const added of record.messagesAdded ?? []) {
-          if (added.message?.id) ids.push(added.message.id);
+        const added = (record.messagesAdded ?? [])
+          .map((m) => m.message?.id)
+          .filter((id): id is string => Boolean(id));
+        // Stop BEFORE a record that would blow the budget: the anchor only
+        // ever moves over records whose messages were all collected, so the
+        // downstream batch cap can never orphan a message behind it. (The
+        // ids.length guard takes a single record larger than the whole budget
+        // in one gulp — oversized is recoverable, stalling forever is not.)
+        if (ids.length > 0 && ids.length + added.length > MAX_MESSAGES_PER_SYNC) {
+          capped = true;
+          break;
         }
+        ids.push(...added);
+        if (record.id) historyId = record.id;
       }
+      if (capped) break;
+
       pageToken = res.data.nextPageToken ?? undefined;
+      // Fully drained — now, and only now, the response-level historyId is a
+      // truthful "caught up to here", and it also keeps the anchor fresh on
+      // quiet days when no records arrive at all.
+      if (!pageToken && res.data.historyId) historyId = res.data.historyId;
     } while (pageToken && ids.length < MAX_MESSAGES_PER_SYNC);
 
     return { ids, historyId };
@@ -160,21 +212,35 @@ async function listIncremental(
   }
 }
 
-async function listByQuery(api: gmail_v1.Gmail): Promise<string[]> {
+async function listByQuery(
+  api: gmail_v1.Gmail,
+): Promise<{ ids: string[]; complete: boolean }> {
   const days = fallbackWindowDays();
   const q = `newer_than:${days}d -in:sent -in:draft -in:chats`;
   const ids: string[] = [];
+  // FRESH ids gate the cap, not listed ids: the search always restarts from
+  // the newest message, so counting raw listings meant a window holding more
+  // than one cap of already-stored mail re-listed the same newest batch every
+  // pass and never reached the older remainder — the scan stalled forever
+  // while looking healthy.
+  let freshCount = 0;
   let pageToken: string | undefined;
 
   do {
     const res = await gmailCall(() =>
       api.users.messages.list({ userId: 'me', q, maxResults: 100, pageToken }),
     );
-    for (const m of res.data.messages ?? []) if (m.id) ids.push(m.id);
+    for (const m of res.data.messages ?? []) {
+      if (!m.id) continue;
+      ids.push(m.id);
+      if (!alreadyStored(m.id)) freshCount++;
+    }
     pageToken = res.data.nextPageToken ?? undefined;
-  } while (pageToken && ids.length < MAX_MESSAGES_PER_SYNC);
+  } while (pageToken && freshCount < MAX_MESSAGES_PER_SYNC);
 
-  return ids;
+  // A leftover pageToken means an unknown remainder was never listed, and the
+  // caller must not treat this scan as a complete picture of the window.
+  return { ids, complete: !pageToken };
 }
 
 /** Reach back far enough to cover the oldest send still awaiting an outcome. */

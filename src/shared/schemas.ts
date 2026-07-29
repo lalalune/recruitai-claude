@@ -319,6 +319,9 @@ export const icpPatchSchema = z
  * consumer/Workspace account — a higher number cannot be honoured, it can only
  * get the mailbox rate-limited mid-run.
  */
+// Bounds here MUST match the read-side clamps in src/main/settings.ts
+// (getSending/getCrawl) — a wider schema silently rewrites accepted values on
+// the next read; a narrower one locks the operator out of legal ones.
 export const sendingPatchSchema = z.object({
   perHour: z.number().int().min(1, 'perHour must be at least 1').max(200, 'perHour cannot exceed 200').optional(),
   perDay: z
@@ -329,10 +332,11 @@ export const sendingPatchSchema = z.object({
     .optional(),
   windowStart: clockSchema.optional(),
   windowEnd: clockSchema.optional(),
-  jitterPct: z.number().int().min(0, 'jitterPct cannot be negative').max(100, 'jitterPct cannot exceed 100').optional(),
+  jitterPct: z.number().int().min(0, 'jitterPct cannot be negative').max(90, 'jitterPct cannot exceed 90').optional(),
   weekends: z.boolean().optional(),
   signature: z.string().max(2000, 'Signature is too long').optional(),
   includeOptOutLine: z.boolean().optional(),
+  postalAddress: z.string().max(500, 'Postal address is too long').optional(),
 });
 
 export const crawlPatchSchema = z.object({
@@ -351,11 +355,24 @@ export const crawlPatchSchema = z.object({
   linkedinEnabled: z.boolean().optional(),
 });
 
+const bandTemplateSchema = z.object({
+  subject: z.string().max(300, 'Template subject is too long'),
+  body: z.string().max(20_000, 'Template body is too long'),
+});
+
+export const templatesPatchSchema = z.object({
+  under_20: bandTemplateSchema.optional(),
+  '20_75': bandTemplateSchema.optional(),
+  '75_300': bandTemplateSchema.optional(),
+  over_300: bandTemplateSchema.optional(),
+});
+
 export const settingsPatchSchema = z.object({
   icp: icpPatchSchema.optional(),
   sending: sendingPatchSchema.optional(),
   crawl: crawlPatchSchema.optional(),
   spendCapUsd: z.number().min(0, 'spendCapUsd cannot be negative').max(1_000_000).optional(),
+  templates: templatesPatchSchema.optional(),
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -412,17 +429,22 @@ export const Schemas = {
 
   // outreach
   listDrafts: z.tuple([draftStateSchema.optional()]),
-  generateDraft: z.tuple([idSchema, idSchema.optional()]),
+  generateDraft: z.tuple([idSchema, idSchema.optional(), z.boolean().optional()]),
   patchDraft: z.tuple([idSchema, draftPatchSchema.default({})]),
   queueDraft: z.tuple([idSchema]),
+  unqueueDraft: z.tuple([idSchema]),
   skipDraft: z.tuple([idSchema]),
   sendNow: z.tuple([idSchema]),
+  sendTestEmail: z.tuple([idSchema]),
   getSendStats: z.tuple([]),
   startSending: z.tuple([]),
   pauseSending: z.tuple([]),
   listInbound: z.tuple([z.boolean().optional()]),
   markInbound: z.tuple([idSchema, inboundActionSchema]),
   syncInbox: z.tuple([]),
+  listSent: z.tuple([]),
+  getPerformance: z.tuple([]),
+  generateFollowUp: z.tuple([idSchema]),
 
   // settings
   getSettings: z.tuple([]),
@@ -451,7 +473,9 @@ export const Schemas = {
 
   // misc
   getStats: z.tuple([]),
-  exportCsv: z.tuple([exportWhatSchema]),
+  // 10k stays well under SQLite's bound-parameter ceiling (~32k) — the ids
+  // become one placeholder each.
+  exportCsv: z.tuple([exportWhatSchema, z.array(idSchema).max(10_000, 'Export selections are capped at 10,000 companies').optional()]),
   backupNow: z.tuple([]),
   openDataDir: z.tuple([]),
   openExternal: z.tuple([externalUrlSchema]),

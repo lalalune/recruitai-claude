@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # node:sqlite and path behavior differ per OS; testing only macOS let
+        # separator and keyring assumptions rot unverified.
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Tests run under Node (node:sqlite, node:test); bun is only the task runner.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      - run: bun run test
+
+      - run: bun run build
+
+      # Real Electron boot: main process + preload + built renderer over IPC.
+      - if: runner.os == 'macOS'
+        run: bun run test:boot
+
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          xvfb-run -a bun run test:boot
+      # Windows: unit/e2e suites cover it; a headed Electron boot on the
+      # Windows runner is flaky enough to cost more signal than it adds.

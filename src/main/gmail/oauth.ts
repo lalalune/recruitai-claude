@@ -19,7 +19,9 @@
 
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { AddressInfo } from 'node:net';
+import path from 'node:path';
 import { OAuth2Client, CodeChallengeMethod } from 'google-auth-library';
 import { gmail, gmail_v1 } from '@googleapis/gmail';
 import { getDb, prep } from '../db/index.js';
@@ -94,7 +96,14 @@ let electronCache: ElectronModule | null | undefined;
 async function electron(): Promise<ElectronModule | null> {
   if (electronCache !== undefined) return electronCache;
   try {
-    electronCache = (await import('electron')) as ElectronModule;
+    // require(), not import(): esbuild preserves a dynamic import of an
+    // external module as a genuine ESM import() in the CJS bundle, which under
+    // plain Node resolves to the npm installer package (a path string, no .app)
+    // and slips past any Module._load interception. require() is the road every
+    // static electron import in this codebase already takes after bundling —
+    // Electron's own module registry and the test stub both intercept it.
+    const nodeRequire = createRequire(path.join(process.cwd(), 'noop.cjs'));
+    electronCache = nodeRequire('electron') as ElectronModule;
     if (!electronCache?.app) electronCache = null;
   } catch {
     electronCache = null;
@@ -116,10 +125,15 @@ export function setGmailEventSink(fn: EventSink | null): void {
 }
 
 export function emitGmailEvent<K extends EventName>(channel: K, payload: RecruitEvents[K]): void {
-  try {
-    sink?.(channel, payload);
-  } catch (err) {
-    console.warn('[gmail] event sink threw:', err);
+  if (sink) {
+    // A wired sink targets the main window only; do not also broadcast, which
+    // would push app events into the LinkedIn login/worker windows.
+    try {
+      sink(channel, payload);
+    } catch (err) {
+      console.warn('[gmail] event sink threw:', err);
+    }
+    return;
   }
   void (async () => {
     const e = await electron();
@@ -488,20 +502,32 @@ function startLoopbackServer(expectedState: string): {
       return;
     }
 
+    if (!code) {
+      // Neither code nor error is not a completed consent. Showing the success
+      // page here would tell the operator "connected" in the browser while
+      // connectGmail is about to report a failure in the app.
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(resultPage('Authorisation failed', 'Google returned no authorisation code. Nothing was changed.'));
+      if (!settled) {
+        settled = true;
+        resolveResult({});
+      }
+      return;
+    }
+
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(resultPage('Gmail connected', 'You can close this tab and return to recruitAI.'));
     if (!settled) {
       settled = true;
-      resolveResult({ code: code ?? undefined });
+      resolveResult({ code });
     }
   });
 
   server.on('error', (err) => {
+    // Reject the PORT promise only. The caller awaits `port` first and throws
+    // there on a bind failure — also rejecting `result`, which nothing is
+    // awaiting yet on that path, escalated to an uncaughtException.
     rejectPort(err);
-    if (!settled) {
-      settled = true;
-      rejectResult(err);
-    }
   });
 
   server.listen(0, '127.0.0.1', () => {
@@ -560,7 +586,25 @@ export interface ConnectResult {
   message: string;
 }
 
-export async function connectGmail(): Promise<ConnectResult> {
+let connectInFlight: Promise<ConnectResult> | null = null;
+
+/**
+ * Re-entrancy guard. A double-click on Connect must not open two consent tabs
+ * backed by two loopback servers, with the loser's token overwriting the
+ * winner's. Concurrent callers join the in-flight attempt and share its
+ * result — deliberately not `async`, so every caller gets the same promise
+ * object rather than a fresh wrapper around it.
+ */
+export function connectGmail(): Promise<ConnectResult> {
+  if (!connectInFlight) {
+    connectInFlight = runConnectFlow().finally(() => {
+      connectInFlight = null;
+    });
+  }
+  return connectInFlight;
+}
+
+async function runConnectFlow(): Promise<ConnectResult> {
   const creds = await getClientCredentials();
   if (!creds) return { ok: false, message: CLIENT_SETUP_MESSAGE };
 
@@ -625,19 +669,37 @@ export async function connectGmail(): Promise<ConnectResult> {
 
     client.setCredentials(tokens);
 
-    const api = gmailForClient(client);
-    const profile = await api.users.getProfile({ userId: 'me' });
-    const address = profile.data.emailAddress ?? null;
-    const historyId = profile.data.historyId ?? null;
-
+    // Persist the grant the moment it exists. Google has already recorded the
+    // consent on their side, so discarding the token over a transient failure
+    // in the profile probe below would leave a live grant the app has lost —
+    // and burn another full consent round-trip to get it back.
     await setSecret(KEY_REFRESH_TOKEN, tokens.refresh_token);
+    setSetting(KEY_CONNECTED_AT, String(Date.now()));
+    clearReauthFlag();
+    resetClientCache();
+
+    const api = gmailForClient(client);
+    let address: string | null = null;
+    let historyId: string | null = null;
+    try {
+      const profile = await api.users.getProfile({ userId: 'me' });
+      address = profile.data.emailAddress ?? null;
+      historyId = profile.data.historyId ?? null;
+    } catch (err) {
+      // The token is saved and stays saved; only the verification failed.
+      const converted = classifyGmailError(err);
+      return {
+        ok: false,
+        message:
+          `Connected, but verifying the account failed: ${converted.message} ` +
+          'The token was saved — use "Test connection" in Settings to verify.',
+      };
+    }
+
     if (address) setSetting(KEY_ADDRESS, address);
     // Anchor incremental sync here so the first syncInbox() doesn't have to
     // decide what "recent" means with no prior state.
     if (historyId) setSetting(KEY_HISTORY_ID, historyId);
-    setSetting(KEY_CONNECTED_AT, String(Date.now()));
-    clearReauthFlag();
-    resetClientCache();
 
     return {
       ok: true,

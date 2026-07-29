@@ -20,12 +20,17 @@ import { gunzipSync } from 'node:zlib';
 import type { Company, Confidence, Contact, Persona, SourceId, VerificationVerdict } from '../../shared/types.js';
 import type { ContactRow } from '../../shared/ipc.js';
 import { scoreContact } from '../../shared/score.js';
+import { electPrimaryContact } from './scoring.js';
+import { resolveEntityField } from './ingest.js';
+import { COMPANY_SUPPRESSION_MATCH } from './suppression.js';
 import { type Db, all, get, prep, run, ulid } from '../db/index.js';
 import {
   domainOf,
+  getCatchAllFlag,
   isRoleAccount,
   localPartOf,
   normalizeEmail,
+  verdictReliability,
 } from '../verify/mx.js';
 import {
   generateCandidates,
@@ -112,8 +117,6 @@ export function classifySeniority(title: string | null | undefined): string | nu
 // Provenance
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CONFIDENCE_RANK: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
-
 export interface ObservationInput {
   entity: 'company' | 'contact' | 'req';
   entityId: string;
@@ -137,51 +140,13 @@ export function recordObservation(db: Db, o: ObservationInput): number {
      RETURNING id`,
   ).get(o.entity, o.entityId, o.field, o.value, o.source, o.evidenceId, o.confidence) as { id: number };
 
-  resolveField(db, o.entity, o.entityId, o.field);
+  // ONE resolver for the whole app — ingest.ts's, which ranks by source trust
+  // (an inference can never beat something actually observed) and computes
+  // conflict over the latest observation per source. This module used to run
+  // its own confidence-ranked variant with all-history conflicts; whichever
+  // wrote last won, and the provenance panel depended on write order.
+  resolveEntityField(db, o.entity, o.entityId, o.field);
   return inserted.id;
-}
-
-function resolveField(db: Db, entity: string, entityId: string, field: string): void {
-  const obs = all<{ id: number; value: string | null; source: string; confidence: Confidence }>(
-    db,
-    `SELECT id, value, source, confidence
-       FROM field_observation
-      WHERE entity = ? AND entity_id = ? AND field = ?
-      ORDER BY observed_at DESC, id DESC`,
-    entity,
-    entityId,
-    field,
-  );
-  if (obs.length === 0) return;
-
-  // The operator's own edit always wins; otherwise higher confidence, then
-  // more recent (the list is already newest-first, so ties keep the first).
-  const rank = (o: (typeof obs)[number]) =>
-    (o.source === 'human' ? 100 : 0) + (CONFIDENCE_RANK[o.confidence] ?? 0);
-  const winner = obs.reduce((best, cur) => (rank(cur) > rank(best) ? cur : best), obs[0]!);
-
-  const distinct = new Set(obs.filter((o) => o.value != null && o.value !== '').map((o) => o.value));
-
-  run(
-    db,
-    `INSERT INTO field_resolved (entity, entity_id, field, value, source, confidence, obs_id, conflicting, resolved_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch('subsec')*1000)
-     ON CONFLICT (entity, entity_id, field) DO UPDATE SET
-       value       = excluded.value,
-       source      = excluded.source,
-       confidence  = excluded.confidence,
-       obs_id      = excluded.obs_id,
-       conflicting = excluded.conflicting,
-       resolved_at = excluded.resolved_at`,
-    entity,
-    entityId,
-    field,
-    winner.value,
-    winner.source,
-    winner.confidence,
-    winner.id,
-    distinct.size > 1 ? 1 : 0,
-  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -728,9 +693,10 @@ export async function discoverContacts(
   let observedEmails = 0;
 
   // ① Job descriptions that name a person.
-  const reqs = all<{ id: number; named_contact: string | null; description: string | null; url: string }>(
+  // req.source is NOT NULL and only ever written with SourceId members.
+  const reqs = all<{ id: number; named_contact: string | null; description: string | null; url: string; source: SourceId }>(
     db,
-    `SELECT id, named_contact, description, url FROM req WHERE company_id = ? AND closed_at IS NULL`,
+    `SELECT id, named_contact, description, url, source FROM req WHERE company_id = ? AND closed_at IS NULL`,
     companyId,
   );
 
@@ -742,7 +708,9 @@ export async function discoverContacts(
           fullName: parsed.fullName,
           title: parsed.title,
           email: parsed.email,
-          source: 'greenhouse',
+          // Provenance carries the req's ACTUAL source — a lever or ashby
+          // harvest labelled 'greenhouse' poisons the provenance panel.
+          source: req.source,
           confidence: 'high',
         });
         if (parsed.email) observedEmails++;
@@ -891,6 +859,8 @@ export interface DecisionInput {
   /** Distinct non-inferred sources that observed this address. 0 = pure guess. */
   sourceCount: number;
   role?: boolean;
+  /** mx.verdictReliability() for the address's mail provider. */
+  mxReliability?: 'high' | 'medium' | 'low';
 }
 
 export interface Decision {
@@ -922,6 +892,12 @@ export function decideContact(i: DecisionInput): Decision {
   }
 
   if (i.verdict === 'valid') {
+    // mx.ts verdictReliability: Microsoft 365 and SEG gateways accept nearly
+    // everything at RCPT, so a paid "valid" carries little information there —
+    // the documented policy routes those to review instead of send.
+    if (i.mxReliability === 'low') {
+      return { decision: 'review', reason: 'Verifier says valid, but this mail provider accepts almost anything — review' };
+    }
     if (i.sourceCount > 0) return { decision: 'send', reason: 'Observed address, verified deliverable' };
     if (i.patternConformance >= 0.6) {
       return { decision: 'send', reason: 'Pattern-derived address, verified deliverable' };
@@ -953,6 +929,12 @@ export interface VerifyCompanyOptions {
   candidatesWithPattern?: number;
   candidatesWithoutPattern?: number;
   config?: VerifierConfig;
+  /**
+   * Restrict the run to one contact. The operator's `v` key re-verifies one
+   * person — without this, force-re-verifying one contact re-charged every
+   * address at the company.
+   */
+  onlyContactId?: string;
 }
 
 export interface VerifyCompanyReport {
@@ -974,9 +956,16 @@ function isSuppressed(db: Db, company: Company): string | null {
     );
     if (d) return `domain suppressed (${d.reason})`;
   }
+  // The same triple-identity match every other barrier uses — a raw
+  // `value = company.id` compare never matched (values are stored lowercased,
+  // ULIDs are uppercase) and paid verifier credits were spent on suppressed
+  // companies.
   const c = get<{ reason: string }>(
     db,
-    "SELECT reason FROM suppression WHERE kind = 'company' AND value = ?",
+    `SELECT s.reason FROM suppression s
+      WHERE s.kind = 'company'
+        AND EXISTS (SELECT 1 FROM company co WHERE co.id = ? AND ${COMPANY_SUPPRESSION_MATCH})
+      LIMIT 1`,
     company.id,
   );
   return c ? `company suppressed (${c.reason})` : null;
@@ -1012,15 +1001,35 @@ function applyVerdict(
   // contact.email carries a global UNIQUE index. Two people can genuinely
   // resolve to the same address (a shared alias, or the same person listed at
   // two companies); writing it would abort the whole run on a constraint error,
-  // so the observation is recorded and the column is left alone.
+  // so a NOTE is recorded and the column is left alone. Deliberately not an
+  // 'email' observation: under trust-ranked resolution a verifier-source email
+  // row would beat the observed one and flip the resolved value to an address
+  // that belongs to someone else.
   const owner = get<{ id: string }>(db, 'SELECT id FROM contact WHERE email = ?', email);
   if (owner && owner.id !== contact.id) {
     recordObservation(db, {
       entity: 'contact',
       entityId: contact.id,
-      field: 'email',
-      value: email,
+      field: 'email_conflict',
+      value: `${email} already belongs to another contact`,
       source: pattern ? 'pattern_inference' : 'verifier',
+      evidenceId: result.evidenceId,
+      confidence: 'low',
+    });
+    return;
+  }
+
+  // The paid verification awaited the network with a PRE-await snapshot of
+  // this row. If the operator corrected the address meanwhile, writing the
+  // old address (and its verdict) back would erase their edit with stale data.
+  const current = get<{ email: string | null }>(db, 'SELECT email FROM contact WHERE id = ?', contact.id);
+  if (current && current.email !== contact.email && current.email !== email) {
+    recordObservation(db, {
+      entity: 'contact',
+      entityId: contact.id,
+      field: 'email_conflict',
+      value: `verification of ${email} finished after the address was changed to ${current.email ?? '(cleared)'} — result not applied`,
+      source: 'verifier',
       evidenceId: result.evidenceId,
       confidence: 'low',
     });
@@ -1114,6 +1123,7 @@ export async function verifyCompanyContacts(
   const jobs: Job[] = [];
 
   for (const c of rows) {
+    if (opts.onlyContactId && c.id !== opts.onlyContactId) continue;
     if (c.status === 'contacted' || c.status === 'replied') continue;
 
     if (c.email) {
@@ -1201,6 +1211,13 @@ export async function verifyCompanyContacts(
     const scored = list
       .map((j) => ({ job: j, result: byEmail.get(j.email) }))
       .filter((x): x is { job: Job; result: VerifyResult } => Boolean(x.result))
+      // A procedural 'unknown' — provider blocked mid-run, or a ledger
+      // collision with no evidence behind it — is not a judgement about the
+      // address. Applying it would stamp email_verified_at and freeze the
+      // contact out of verification for a whole freshness window, and can
+      // overwrite a real 'valid' with noise. Drop those results; the contact
+      // simply stays as it was and the next run retries.
+      .filter((x) => !(x.result.blocked || (x.result.verdict === 'unknown' && x.result.evidenceId == null)))
       .sort(
         (a, b) =>
           VERDICT_RANK[b.result.verdict] - VERDICT_RANK[a.result.verdict] || a.job.rank - b.job.rank,
@@ -1242,10 +1259,13 @@ export async function verifyCompanyContacts(
     const sourceCount = sourceCountFor(db, contactId, best.job.email);
     const decision = decideContact({
       verdict: best.result.verdict,
-      catchAll: best.result.catchAll,
+      // The provider's answer wins; when it said nothing about catch-all, the
+      // per-domain flag saved from earlier verifications fills the gap.
+      catchAll: best.result.catchAll ?? getCatchAllFlag(db, domainOf(best.job.email)),
       patternConformance: conformance,
       sourceCount,
       role: best.result.role || isRoleAccount(best.job.email),
+      mxReliability: best.result.mxProvider ? verdictReliability(best.result.mxProvider) : undefined,
     });
     decisions.push({ contactId, email: best.job.email, decision: decision.decision, reason: decision.reason });
 
@@ -1299,9 +1319,6 @@ export function rescoreCompanyContacts(db: Db, companyId: string, preloaded?: Co
   const rows = contactRows(db, companyId);
   if (rows.length === 0) return;
 
-  let bestId: string | null = null;
-  let bestScore = -1;
-
   for (const r of rows) {
     const score = scoreContact(toContact(r), company);
     run(
@@ -1310,16 +1327,12 @@ export function rescoreCompanyContacts(db: Db, companyId: string, preloaded?: Co
       score,
       r.id,
     );
-    if (r.status !== 'rejected' && score > bestScore) {
-      bestScore = score;
-      bestId = r.id;
-    }
   }
 
-  if (bestId) {
-    run(db, 'UPDATE contact SET is_primary = 0 WHERE company_id = ? AND id <> ?', companyId, bestId);
-    run(db, 'UPDATE contact SET is_primary = 1 WHERE id = ?', bestId);
-  }
+  // One elector for the whole app. This function used to run its own (score
+  // only), which ignored both the reviewed-manual-primary rule and the
+  // prefer-contacts-with-an-address rule — whichever path wrote last won.
+  electPrimaryContact(db, companyId);
 }
 
 /** Single-contact re-verification, for the operator's `v` key. */
@@ -1330,7 +1343,11 @@ export async function verifyContactById(
 ): Promise<ContactRow | null> {
   const contact = get<ContactDbRow>(db, 'SELECT * FROM contact WHERE id = ?', contactId);
   if (!contact) return null;
-  await verifyCompanyContacts(db, contact.company_id, { force: opts.force ?? true, tryCandidates: true });
+  await verifyCompanyContacts(db, contact.company_id, {
+    force: opts.force ?? true,
+    tryCandidates: true,
+    onlyContactId: contactId,
+  });
   const after = get<ContactDbRow>(db, 'SELECT * FROM contact WHERE id = ?', contactId);
   return after ? toContactRow(after) : null;
 }

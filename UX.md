@@ -10,7 +10,7 @@
 |---|---|
 | You review **every** record, ~5,000 companies | The review loop must run at 100–150 records/hour. That means keyboard-first, near-zero mouse, no modal dialogs in the hot path. |
 | Every email is **individually tailored** | Drafting is a first-class screen, not an export. Generated draft → you edit → you send. |
-| **20/hour, 400/day**, personal Gmail | A paced send queue with a visible governor. The UI must make "how many left today" obvious at all times. |
+| **20/hour, 150/day default** (hard cap 500), personal Gmail | A paced send queue with a visible governor. The UI must make "how many left today" obvious at all times. |
 | Quality score **1–10**, best first | Score is the default sort everywhere and appears on every row. |
 | Sources disagree → **highlight conflicts** | Field-level provenance is a core primitive, not a debug view. |
 | Screenshots as evidence | An evidence viewer, inline in the review pane. |
@@ -136,7 +136,7 @@ A second row of toggle chips (multi-select): Has verified email · No in-house T
 **Row anatomy:** `[score] CompanyName · headcount · N reqs · [chips]`
 Chips: `●` unreviewed, `⚠` has conflict, `✉` email verified, `⛔` suppressed, `↩` replied.
 
-**Interactions:** `j`/`k` or ↑/↓ move; click selects; `shift+click` range-selects; `cmd+click` toggles; `space` peeks without advancing. Selection persists across filter changes. Multi-select reveals a bulk `ActionBar`: Approve all · Reject all · Re-verify · Suppress domain · Export CSV.
+**Interactions:** `j`/`k` or ↑/↓ move; click selects; `shift+click` range-selects; `cmd+click` toggles; `space` peeks without advancing. Selection persists across filter changes. Multi-select reveals a bulk `ActionBar`: Approve all · Reject all · Re-discover contacts · Suppress domain · Export CSV (exports the selected companies; with nothing selected it exports everything).
 
 ### 5.3 Right pane sections
 
@@ -185,7 +185,7 @@ Verification chips: `valid` green · `catch-all` amber · `unknown` grey · `inv
 
 ## 6. Screen: Outreach
 
-Three tabs, all reusing `SplitView`.
+Four tabs — Drafts · Queue · Sent · Replies.
 
 ### 6.1 Drafts
 
@@ -198,7 +198,7 @@ Right: `EmailComposer`.
 - **Preview toggle** — rendered exactly as it will send.
 - **Regenerate** — re-runs generation; a variant selector keeps the previous draft so you can compare.
 
-Actions: `⌘↵` Queue for sending · `s` Skip · `x` Reject · `n` Next.
+Actions: `⌘↵` Queue for sending · `s` Skip · `x` Reject · `n` Next · **Test to me** sends the draft to your own inbox with a `[TEST]` subject (no prospect touched, no pacing charge).
 
 **Generation happens in the background** as soon as a company is approved, so drafts are waiting when you arrive rather than spinning.
 
@@ -208,12 +208,22 @@ The paced sender. This screen is mostly a governor readout.
 
 - **Header:** `47 / 400 today · 3 / 20 this hour · next send in 2m 14s`
 - **Controls:** ▶ Start · ⏸ Pause · ⏭ Send next now
-- **List:** ordered queue with scheduled send time per item; drag to reorder; `x` removes.
-- **Settings inline:** sends per hour (default 20), sends per day (default 400), active window (default 9am–5pm local), jitter (default ±40%), weekend sending (default off).
+- **List:** ordered queue with scheduled send time per item; `x` (or the trash button) returns a draft to the Drafts tab untouched. (Order comes from the pacing engine — there is no manual drag-reorder.)
+- **Settings inline:** sends per hour (default 20, max 200), sends per day (default 150, max 500 — Gmail's own ceiling), active window (default 9am–5pm local), jitter (default ±40%, max 90), weekend sending (default off).
 
 Sends fire on a jittered timer inside the active window. Closing the app pauses the queue; reopening resumes without double-sending (each send is guarded by a unique idempotency key).
 
-### 6.3 Replies
+### 6.3 Sent
+
+Every message that left, newest first, with its outcome chip (`sent` · `silent` · `replied` · `bounced`).
+
+- **Reply rates strip** — reply and bounce rates broken down by template band and copy kind (built-in · custom template · follow-up), computed from the send ledger. This is the copy-iteration loop: edit a template in Settings, watch its band's rate move here.
+- **Bounce circuit breaker** — if ≥3 of the trailing 50 sends bounced (and ≥10%), sending pauses itself before another message can damage the account's reputation; the pause reason names the numbers.
+
+- **Follow up** — for a sent-and-silent message at least two days old, drafts a short bump that **threads onto the original Gmail conversation** (same thread id, proper `In-Reply-To`/`References`). Refused with a reason when they replied, the address bounced, an active follow-up already exists, or the roles the thread was about have closed.
+- Follow-up drafts appear in the Drafts tab like any other draft and ride the same queue, pacing, and suppression barriers.
+
+### 6.4 Replies
 
 Left: inbound messages matched to companies, newest first, with type chips: `reply` · `bounce` · `auto-reply` · `unmatched`.
 Right: the message thread plus the company card.
@@ -228,7 +238,7 @@ This closes the loop you asked for: a bounce or a no becomes the trigger to adva
 
 One card per source. Each card: name, enabled toggle, last run time, records found, [Run] button, and a progress bar while running.
 
-**Sources:** YC directory · ATS sweep (Greenhouse, Ashby, Lever, SmartRecruiters, Workable, Workday) · Careers-page crawler · HN Who's Hiring · SEC Form D · LinkedIn *(off by default)* · Email discovery · Email verification · Scoring · Draft generation.
+**Sources:** YC directory · ATS sweep (Greenhouse, Ashby, Lever, SmartRecruiters, Workable — Workday is parsed but not probed; it needs per-company tenant+site discovery) · Careers-page crawler · HN Who's Hiring · SEC Form D · LinkedIn *(off by default)* · Email discovery · Email verification · Scoring · Draft generation.
 
 **Global controls:** ▶ Run all · ⏹ Stop · a live log tail (last 200 lines, filterable by source) · a spend counter showing per-source and total cost.
 
@@ -247,14 +257,16 @@ Single scrolling page, sectioned. No tabs.
 **Gmail** — connect / disconnect, connected address, token status, test-send button.
 **API keys** — verification provider key, LLM key. Masked, with a test button each.
 **Rate limits** — sends/hour, sends/day, active window, jitter, crawl concurrency, LinkedIn profiles/day.
-**ICP** — headcount min/max (default 3–1000), geography (Bay Area counties, multi-select), included industries, **excluded keywords**, minimum open reqs, exclude companies with in-house TA above N recruiters.
+**ICP** — headcount min/max (default 3–1000), require Bay Area (single toggle), stale-req threshold in days (default 45), **excluded keywords** (matched against company name and industry), deprioritise companies with in-house TA above N recruiters. *(Speced but not implemented: a per-county geography multi-select — geography shipped as the single toggle — an included-industries list, and a minimum-open-reqs filter.)*
 **Templates** — email templates per company-size band (<20, 20–75, 75–300, 300+), each with variable autocomplete and a live preview.
 **Suppression** — table of suppressed domains and addresses with typed reasons (existing client · competitor · no-agency policy · replied no · bounced · manual). Import CSV, add manually.
 **Data** — data folder path, DB size, [Backup now], [Export CSV], [Open data folder].
 
+*Restore procedure (manual, deliberately):* quit the app, open the data folder, replace `recruitai.db` with a file from `backups/` (daily snapshots `recruitai-YYYY-MM-DD.db`, manual ones `recruitai-manual-*.db`), relaunch. There is no in-app restore button — overwriting the live database is exactly the kind of action that should require the app to be closed.
+
 ---
 
-## 9. Setup (first run only)
+## 9. Setup (first run; rerun anytime via the command palette's "Run setup wizard")
 
 Four steps, skippable, resumable. Reuses Settings components.
 
@@ -294,7 +306,7 @@ Naming these matters as much as the feature list — each one is complexity that
 - **No mobile layout.** Desktop tool; minimum window 1024×700.
 - **No real-time collaboration, comments or mentions.**
 - **No in-app browser for LinkedIn.** It opens a real, visible browser window you control.
-- **No unsubscribe-link management.** Low-volume personal outreach. *(One note: a plain "reply and I'll stop" line in the template body costs nothing and materially reduces both complaint risk and Cal. B&P §17529.5 exposure — see PLAN.md §5. Recommended as template default; you can delete it.)*
+- **No unsubscribe-link management.** Low-volume personal outreach. *(A plain "reply with 'no thanks'" opt-out line is on by default and — while the Settings toggle is on — is re-added at send time even if edited out of a draft, alongside the postal address. To send without it, turn the toggle off in Settings; that is a deliberate compliance decision, not a per-draft edit. See PLAN.md §5 on Cal. B&P §17529.5.)*
 
 ---
 

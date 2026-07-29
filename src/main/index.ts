@@ -12,11 +12,33 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { initDb, closeDb, getDb, backup } from './db/index.js';
-import { registerIpc } from './ipc/index.js';
+import { resolveWithin } from './util/apppath.js';
+import { registerIpc, wireWindow } from './ipc/index.js';
+import { pauseSending } from './ipc/outreach.js';
 import { setPipelineWindow } from './pipeline/run.js';
 import { startDrainer, stopDrainer } from './pipeline/drain.js';
 
 const isDev = process.argv.includes('--dev') || !app.isPackaged;
+
+/**
+ * One instance only. Two processes sharing the SQLite file means two drainers,
+ * double rate accounting, and reconcileInterruptedSends() in one instance
+ * failing sends the other instance is mid-flight on.
+ *
+ * app.exit does not stop the rest of this module from evaluating (only
+ * mkdirs — harmless), but whenReady below re-checks isPrimary so the losing
+ * instance can never open the database or start the drainer.
+ */
+const isPrimary = app.requestSingleInstanceLock();
+if (!isPrimary) {
+  app.exit(0);
+}
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  }
+});
 
 // Must be registered before app is ready, and before any window exists.
 protocol.registerSchemesAsPrivileged([
@@ -76,25 +98,52 @@ function createWindow(): void {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false, // preload needs require() for the ipcRenderer bridge
+      // Sandboxed preloads still get require('electron') for the
+      // contextBridge/ipcRenderer pair, which is all this preload uses.
+      sandbox: true,
       spellcheck: true,
     },
   });
 
   mainWindow.once('ready-to-show', () => mainWindow?.show());
 
-  if (isDev) {
-    mainWindow.loadURL('http://localhost:5183');
-    // Opt-in rather than automatic: RECRUITAI_DEVTOOLS=1 bun run dev
-    if (process.env.RECRUITAI_DEVTOOLS) mainWindow.webContents.openDevTools({ mode: 'detach' });
-  } else {
-    mainWindow.loadURL('app://-/index.html');
+  const startUrl = isDev ? 'http://localhost:5183' : 'app://-/index.html';
+  mainWindow.loadURL(startUrl);
+  // Opt-in rather than automatic: RECRUITAI_DEVTOOLS=1 bun run dev
+  if (isDev && process.env.RECRUITAI_DEVTOOLS) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
 
   // External links open in the real browser, never in the app shell.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//.test(url)) shell.openExternal(url);
     return { action: 'deny' };
+  });
+
+  // A plain anchor around scraped content must not navigate the app shell —
+  // window.open is covered above, top-frame navigation is covered here.
+  //
+  // Deny-by-default: the renderer is a single-page app, so the ONLY legitimate
+  // top-frame navigation is back to its own entry. Origin comparison alone is
+  // a trap in production — Node's URL gives every non-standard scheme
+  // (app://, file://, data:) the same opaque origin 'null', which would make
+  // "same origin" true for file:///etc/passwd. In dev the http origin is
+  // compared properly ("http://localhost:5183" as a PREFIX would also admit
+  // localhost:51830-51839).
+  const devOrigin = isDev ? new URL(startUrl).origin : null;
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    let allowed = url === startUrl;
+    if (!allowed && devOrigin) {
+      try {
+        allowed = new URL(url).origin === devOrigin;
+      } catch {
+        allowed = false;
+      }
+    }
+    if (!allowed) {
+      event.preventDefault();
+      if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    }
   });
 
   mainWindow.on('closed', () => {
@@ -111,11 +160,8 @@ function registerAppProtocol(): void {
   const root = path.join(__dirname, '../renderer');
   protocol.handle('app', (request) => {
     const { pathname } = new URL(request.url);
-    const rel = pathname === '/' || pathname === '' ? '/index.html' : pathname;
-    const filePath = path.join(root, decodeURIComponent(rel));
-
-    // Never serve outside the renderer root.
-    if (!filePath.startsWith(root)) {
+    const filePath = resolveWithin(root, pathname);
+    if (!filePath) {
       return new Response('Forbidden', { status: 403 });
     }
     // SPA fallback for unknown non-asset paths.
@@ -132,9 +178,12 @@ function rotatingBackup(): void {
     const dest = path.join(dir, `recruitai-${stamp}.db`);
     if (!fs.existsSync(dest)) backup(getDb(), dest);
 
+    // Rotate ONLY the daily snapshots this function writes. The operator's
+    // manual backups (recruitai-manual-*.db, via backupNow) sort above the
+    // dailies lexicographically and a bare *.db filter deleted them.
     const files = fs
       .readdirSync(dir)
-      .filter((f) => f.endsWith('.db'))
+      .filter((f) => /^recruitai-\d{4}-\d{2}-\d{2}\.db$/.test(f))
       .sort()
       .reverse();
     for (const stale of files.slice(7)) fs.unlinkSync(path.join(dir, stale));
@@ -144,6 +193,7 @@ function rotatingBackup(): void {
 }
 
 app.whenReady().then(() => {
+  if (!isPrimary) return;
   initDb(path.join(DATA_DIR, 'recruitai.db'));
   if (!isDev) registerAppProtocol();
   createWindow();
@@ -153,7 +203,12 @@ app.whenReady().then(() => {
   rotatingBackup();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+      // A dock re-activation builds a fresh window; without rewiring it,
+      // pipeline progress and send events go to the destroyed one.
+      wireWindow(mainWindow!);
+    }
   });
 });
 
@@ -162,6 +217,13 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // Pause BEFORE the db closes — the window's own 'closed' hook fires after
+  // this and its pauseSending call would hit a closed database.
+  try {
+    pauseSending(getDb());
+  } catch {
+    /* db was never opened (early quit) — nothing to pause */
+  }
   stopDrainer();
   closeDb();
 });

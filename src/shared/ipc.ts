@@ -264,6 +264,37 @@ export interface DraftRow {
   qualityScore: number | null;
 }
 
+/** One row of the Sent view: the message that left plus what happened to it. */
+export interface SentRow {
+  sendId: string;
+  draftId: string;
+  companyId: string;
+  companyName: string;
+  contactId: string;
+  contactName: string;
+  toEmail: string;
+  subject: string;
+  sentAt: number | null;
+  outcome: 'pending' | 'sent' | 'bounced' | 'replied' | 'silent' | 'failed';
+  /** True when this send was itself a follow-up. */
+  isFollowUp: boolean;
+  /** An active (draft/queued/sending) follow-up already exists for this thread. */
+  hasActiveFollowUp: boolean;
+}
+
+/** Outcome roll-up per template band × copy kind — what the reply-rate table reads. */
+export interface PerformanceRow {
+  /** Headcount band ('under_20' …) or 'follow_up' rows' original band. */
+  band: string;
+  /** builtin | custom | follow_up — which copy produced the send. */
+  kind: 'builtin' | 'custom' | 'follow_up';
+  sent: number;
+  replied: number;
+  bounced: number;
+  /** replied / sent, 0..1. */
+  replyRate: number;
+}
+
 export interface SendStats {
   today: number;
   thisHour: number;
@@ -315,6 +346,8 @@ export interface Settings {
     weekends: boolean;
     signature: string;
     includeOptOutLine: boolean;
+    /** CAN-SPAM: the sender's physical postal address, appended to every message. */
+    postalAddress: string;
   };
   crawl: {
     concurrency: number;
@@ -333,6 +366,11 @@ export interface Settings {
   };
   spendCapUsd: number;
   dataDir: string;
+  /**
+   * Per-band template overrides. An empty subject/body means "use the
+   * built-in renderer for that band" — see src/shared/outreach.ts.
+   */
+  templates: import('./outreach.js').TemplateBands;
 }
 
 export interface SettingsPatch {
@@ -340,6 +378,7 @@ export interface SettingsPatch {
   sending?: Partial<Settings['sending']>;
   crawl?: Partial<Settings['crawl']>;
   spendCapUsd?: number;
+  templates?: Partial<import('./outreach.js').TemplateBands>;
 }
 
 export interface SuppressionRow {
@@ -392,17 +431,27 @@ export interface RecruitApi {
 
   // outreach
   listDrafts(state?: string): Promise<DraftRow[]>;
-  generateDraft(companyId: string, contactId?: string): Promise<DraftRow>;
+  /** `force` is the explicit Regenerate: it may replace an edited or queued draft. Without it, guards apply. */
+  generateDraft(companyId: string, contactId?: string, force?: boolean): Promise<DraftRow>;
   patchDraft(id: string, patch: { subject?: string; body?: string }): Promise<DraftRow>;
   queueDraft(id: string): Promise<void>;
+  unqueueDraft(id: string): Promise<void>;
   skipDraft(id: string): Promise<void>;
   sendNow(id: string): Promise<void>;
+  /** Sends the draft's content to the operator's own Gmail address, subject-prefixed [TEST]. Returns that address. */
+  sendTestEmail(id: string): Promise<string>;
   getSendStats(): Promise<SendStats>;
   startSending(): Promise<void>;
   pauseSending(): Promise<void>;
   listInbound(handled?: boolean): Promise<InboundRow[]>;
   markInbound(id: string, action: 'positive' | 'negative' | 'bounce' | 'ignore'): Promise<void>;
   syncInbox(): Promise<number>;
+  /** Sent messages with their outcome, newest first — the follow-up work surface. */
+  listSent(): Promise<SentRow[]>;
+  /** Reply/bounce rates by template band and copy kind — the copy-iteration loop. */
+  getPerformance(): Promise<PerformanceRow[]>;
+  /** Threaded follow-up draft for a sent-and-silent message. */
+  generateFollowUp(sendId: string): Promise<DraftRow>;
 
   // linkedin
   getLinkedInStatus(): Promise<LinkedInStatus>;
@@ -426,7 +475,8 @@ export interface RecruitApi {
 
   // misc
   getStats(): Promise<DashboardStats>;
-  exportCsv(what: 'companies' | 'contacts' | 'drafts'): Promise<string>;
+  /** Omit `companyIds` for everything; pass ids to export only those companies' rows. */
+  exportCsv(what: 'companies' | 'contacts' | 'drafts', companyIds?: string[]): Promise<string>;
   backupNow(): Promise<string>;
   openDataDir(): Promise<void>;
   openExternal(url: string): Promise<void>;
@@ -438,7 +488,7 @@ export interface RecruitEvents {
   'pipeline:progress': PipelineState;
   'pipeline:log': LogLine;
   'send:progress': SendStats;
-  'data:changed': { entity: 'company' | 'contact' | 'draft' | 'inbound'; id?: string };
+  'data:changed': { entity: 'company' | 'contact' | 'draft' | 'inbound' | 'suppression'; id?: string };
   'gmail:needs-reauth': { address: string | null };
 }
 

@@ -243,6 +243,9 @@ CREATE TABLE draft (
 ) STRICT;
 
 CREATE INDEX draft_state ON draft(state, scheduled_at);
+-- v1 shape. Migration v2 (src/main/db/index.ts) rewrites this to active-only
+-- states and adds draft.follow_up_of + company.ats_miss_count — this file is
+-- the v1 BASELINE, not the final schema; deltas live in the MIGRATIONS list.
 CREATE UNIQUE INDEX draft_contact ON draft(contact_id) WHERE state != 'skipped';
 
 CREATE TABLE send (
