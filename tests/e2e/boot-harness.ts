@@ -153,6 +153,73 @@ async function main(): Promise<void> {
     fail(`zod guard did not reject malformed patchCompany at the boundary (got: ${guardCheck})`);
   } else ok('zod guard rejected malformed patchCompany input at the boundary');
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // Bring-your-own Gmail OAuth client, over live IPC.
+  //
+  // This is the path that shipped broken: with no way to store a client,
+  // connectGmail could only ever refuse, and the refusal was rendered into a
+  // Toaster that the Setup wizard did not mount. Unit tests cover the schema;
+  // only a real boot proves the channel reaches the keychain and that
+  // getSettings reports back what the UI branches on.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  if (settings?.gmail?.clientConfigured !== false) {
+    fail(`fresh profile should report gmail.clientConfigured false (got ${settings?.gmail?.clientConfigured})`);
+  } else ok('fresh profile reports no Gmail OAuth client configured');
+
+  // With no client stored, Connect must refuse with the SETUP message rather
+  // than throwing or opening a browser at a broken consent URL.
+  const noClient = await win.webContents.executeJavaScript(
+    `window.api.connectGmail().then((r) => r, (e) => ({ ok: null, message: String(e && e.message || e) }))`,
+  );
+  if (noClient?.ok !== false || !String(noClient?.message).includes('No Google OAuth client')) {
+    fail(`connectGmail without a client should refuse with the setup message (got: ${JSON.stringify(noClient)})`);
+  } else if (!String(noClient.message).includes('Settings → Gmail')) {
+    fail('the refusal no longer points at where the fields actually are');
+  } else ok('connectGmail without a client refuses with an actionable message');
+
+  // A mispaste must be rejected at the boundary, not stored and then failed at
+  // Google with an error the operator cannot act on.
+  const badId = await win.webContents.executeJavaScript(
+    `window.api.setGmailClient("123456789012", "GOCSPX-x").then(() => 'accepted', (e) => String(e && e.message || e))`,
+  );
+  if (typeof badId !== 'string' || !badId.includes('apps.googleusercontent.com')) {
+    fail(`setGmailClient accepted a non-client-ID string (got: ${badId})`);
+  } else ok('setGmailClient rejects a mispasted client ID at the boundary');
+
+  // Half a client is refused: an id with no secret looks configured but fails.
+  const halfClient = await win.webContents.executeJavaScript(
+    `window.api.setGmailClient("123-abc.apps.googleusercontent.com", "").then(() => 'accepted', (e) => String(e && e.message || e))`,
+  );
+  if (halfClient !== 'accepted' && !String(halfClient).includes('both')) {
+    fail(`half a client should be refused with a both-or-neither message (got: ${halfClient})`);
+  } else if (halfClient === 'accepted') {
+    fail('setGmailClient stored a client ID with no secret');
+  } else ok('setGmailClient refuses a client ID with no secret');
+
+  // The real round trip: store → keychain → getSettings reports configured.
+  const stored = await win.webContents.executeJavaScript(
+    `window.api.setGmailClient("123-abc.apps.googleusercontent.com", "GOCSPX-test-secret")
+       .then(() => window.api.getSettings())
+       .then((s) => s.gmail, (e) => ({ error: String(e && e.message || e) }))`,
+  );
+  if (stored?.error) fail(`setGmailClient round trip threw: ${stored.error}`);
+  else if (stored?.clientConfigured !== true) {
+    fail(`after storing a client, clientConfigured should be true (got ${JSON.stringify(stored)})`);
+  } else ok('setGmailClient persists and getSettings reports clientConfigured');
+
+  // Clearing must actually clear — otherwise a wrong client is unrecoverable
+  // from the UI, which is how this whole area got stuck the first time.
+  const cleared = await win.webContents.executeJavaScript(
+    `window.api.setGmailClient("", "")
+       .then(() => window.api.getSettings())
+       .then((s) => s.gmail, (e) => ({ error: String(e && e.message || e) }))`,
+  );
+  if (cleared?.error) fail(`clearing the client threw: ${cleared.error}`);
+  else if (cleared?.clientConfigured !== false) {
+    fail(`clearing should set clientConfigured false (got ${JSON.stringify(cleared)})`);
+  } else ok('the stored Gmail OAuth client can be cleared again');
+
   if (consoleErrors.length) {
     fail(`renderer console errors:\n  ${consoleErrors.join('\n  ')}`);
   } else {
